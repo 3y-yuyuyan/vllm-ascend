@@ -66,7 +66,6 @@
 #include "moe/fp4_bf16_gmm_v2/fp4_bf16_gmm_v2_torch_adpt.h"
 #include "moe/fp4_bf16_gmm_v2_cache/fp4_bf16_gmm_v2_cache_torch_adpt.h"
 #include "moe/fp4_decode_bench/fp4_decode_bench_torch_adpt.h"
-#include "attention/mla_prolog_v3_k3/mla_prolog_v3_k3_torch_adpt.h"
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/Exception.h>
