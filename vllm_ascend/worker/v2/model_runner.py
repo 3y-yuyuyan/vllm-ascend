@@ -31,7 +31,10 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
-from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+try:
+    from vllm.utils.torch_utils import async_tensor_h2d as async_copy_to_gpu
+except ImportError:
+    from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.eplb_utils import step_eplb_after
@@ -291,7 +294,7 @@ class NPUModelRunner(GPUModelRunner):
             for group in groups
         )
 
-        if self.model_config.enable_return_routed_experts:
+        if getattr(self.model_config, "enable_return_routed_experts", False):
             self.init_routed_experts_capturer()
 
         self.kvpp = KVPPRuntime.create_from_kv_cache(

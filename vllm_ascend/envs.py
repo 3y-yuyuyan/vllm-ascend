@@ -35,7 +35,80 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
     return value == "1"
 
 
+def _fp4_decode_cache_mib() -> int:
+    max_cache_mib = 4096
+    value = int(os.getenv("VLLM_ASCEND_FP4_DECODE_CACHE_MIB", "0"))
+    if not 0 <= value <= max_cache_mib:
+        raise ValueError(f"VLLM_ASCEND_FP4_DECODE_CACHE_MIB must be between 0 and {max_cache_mib} MiB.")
+    return value
+
+
+def _fp4_int8_cube_enabled() -> bool:
+    value = os.getenv("VLLM_ASCEND_FP4_INT8_CUBE", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("VLLM_ASCEND_FP4_INT8_CUBE must be 0 or 1.")
+    return value == "1"
+
+
+def _fp4_decode_backend() -> str:
+    value = os.getenv("VLLM_ASCEND_FP4_DECODE_BACKEND", "torch")
+    if value not in {"torch", "triton"}:
+        raise ValueError("VLLM_ASCEND_FP4_DECODE_BACKEND must be torch or triton.")
+    return value
+
+
+def _fp4_native_gmm_enabled() -> bool:
+    value = os.getenv("VLLM_ASCEND_FP4_NATIVE_GMM", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("VLLM_ASCEND_FP4_NATIVE_GMM must be 0 or 1.")
+    return value == "1"
+
+
+def _fp4_native_expert_cache_enabled() -> bool:
+    value = os.getenv("VLLM_ASCEND_FP4_NATIVE_EXPERT_CACHE", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("VLLM_ASCEND_FP4_NATIVE_EXPERT_CACHE must be 0 or 1.")
+    return value == "1"
+
+
+def _fp4_mxfp4_fallback_enabled() -> bool:
+    return _strict_binary_env("VLLM_ASCEND_FP4_MXFP4_FALLBACK")
+
+
 env_variables: dict[str, Callable[[], Any]] = {
+    # Experimental native tile decode + INT8 Cube pipeline, Ascend 910B only.
+    # Default 0; valid 0/1; not sensitive. Requires FP4_INT8_CUBE=1,
+    # eager pure TP, block32 and DECODE_CACHE_MIB=0 for this first native gate.
+    # Selects a custom operator; no silent fallback if the op is unavailable.
+    "VLLM_ASCEND_FP4_NATIVE_GMM": _fp4_native_gmm_enabled,
+    # Routed + shared expert decode cache held inside the native FP4->INT8 op.
+    # Default 0; valid 0/1; not sensitive. Requires VLLM_ASCEND_FP4_NATIVE_GMM=1,
+    # VLLM_ASCEND_FP4_DECODE_CACHE_MIB>0 (the budget sizes the cache) and the
+    # fp4_int8_gmm_v2_cache custom op; hit experts skip decode entirely.
+    "VLLM_ASCEND_FP4_NATIVE_EXPERT_CACHE": _fp4_native_expert_cache_enabled,
+    # W4A8 MXFP4 BF16 fallback on A2 (910B family). Default 0 (disabled);
+    # valid 0/1; not sensitive. A5 always uses the native FP4 quant matmul.
+    # The fallback decodes packed FP4 weights to BF16 at call time and is
+    # validated at operator level only on Ascend 910B4-1; enabling it on
+    # other A2 variants is the operator's explicit responsibility.
+    # A3 (910C) / _310P, or A2 with this switch off, raise instead of
+    # silently running an unverified path. Requires eager mode.
+    "VLLM_ASCEND_FP4_MXFP4_FALLBACK": _fp4_mxfp4_fallback_enabled,
+    # Online routed FP4 -> INT8 decoder; default torch, valid torch/triton.
+    # triton is opt-in, requires Triton Ascend and hardware validation.
+    # Not sensitive. Only affects INT8 eager A2/A3 expert decoding.
+    "VLLM_ASCEND_FP4_DECODE_BACKEND": _fp4_decode_backend,
+    # Execute routed FP4 experts using INT8 activations/weights and CANN GMM.
+    # Default: 0 (BF16 compatibility path). Valid: 0 or 1; not sensitive.
+    # Requires eager pure-TP A2/A3 inference; adds INT8 requantization error.
+    "VLLM_ASCEND_FP4_INT8_CUBE": _fp4_int8_cube_enabled,
+    # Per-worker/model budget for decoded BF16/INT8 routed FP4 experts on A2/A3.
+    # Default: 0 (disabled). Valid range: 0..4096 MiB; not sensitive.
+    # Requires enforce_eager and immutable inference weights. Storage is
+    # allocated during weight loading, before KV-cache memory profiling.
+    # With VLLM_ASCEND_FP4_NATIVE_GMM=1 this budget sizes the native device
+    # expert cache instead of the Python decode cache (they never coexist).
+    "VLLM_ASCEND_FP4_DECODE_CACHE_MIB": _fp4_decode_cache_mib,
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

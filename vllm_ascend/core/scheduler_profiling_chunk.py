@@ -30,10 +30,17 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import (
-    KVConnectorBlockState,
     NewRequestData,
     SchedulerOutput,
 )
+
+try:
+    from vllm.v1.core.sched.output import KVConnectorBlockState
+except ImportError:
+
+    class KVConnectorBlockState:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs):
+            pass
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType

@@ -27,8 +27,11 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import torch_npu
-from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
+try:
+    from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
+except Exception:
+    def _register_atb_extensions():
+        pass
 from torch_npu.profiler import dynamic_profile as dp
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, get_pcp_group, init_distributed_environment
@@ -144,7 +147,10 @@ class NPUWorker(WorkerBase):
 
         ops.register_dummy_fusion_op()
         if get_current_hardware_profile().supports(HardwareCapability.ATB_EXTENSIONS):
-            _register_atb_extensions()
+            try:
+                _register_atb_extensions()
+            except Exception as e:
+                logger.warning_once("Failed to register ATB extensions (%s); continuing without ATB.", e)
         register_ascend_customop(vllm_config)
         # init ascend config and soc version
         init_ascend_config(vllm_config)
@@ -597,8 +603,13 @@ class NPUWorker(WorkerBase):
         # Override torch_peak_increase with the pre-graph-capture value to
         # avoid double-counting graph pool memory as activation memory.
         profile_result.torch_peak_increase = profile_torch_peak - profile_result.before_profile.torch_peak
-        profile_result.non_kv_cache_memory = (
-            profile_result.non_torch_increase + profile_result.torch_peak_increase + profile_result.weights_memory
+
+        # Keep the measured peak; reducing an estimate does not release memory.
+        # Newer vLLM also accounts for persistent allocations via mem_get_info.
+        # Preserve that result when it exceeds the legacy category sum.
+        profile_result.non_kv_cache_memory = max(
+            profile_result.non_kv_cache_memory,
+            profile_result.non_torch_increase + profile_result.torch_peak_increase + profile_result.weights_memory,
         )
 
         # Save per-category memory for use in compile_or_warm_up_model() (step 5).
@@ -954,10 +965,15 @@ class NPUWorker(WorkerBase):
         )
 
     def _warm_up_atb(self):
-        x = torch.rand((2, 4), dtype=torch.float16).npu()
-        weight = torch.rand((2, 4), dtype=torch.float16).npu()
-        c = torch.rand((4, 4), dtype=torch.float32).npu()
-        torch_npu._npu_matmul_add_fp32(x, weight, c)
+        try:
+            import torch_npu
+            if hasattr(torch_npu, "_npu_matmul_add_fp32"):
+                x = torch.rand((2, 4), dtype=torch.float16).npu()
+                weight = torch.rand((2, 4), dtype=torch.float16).npu()
+                c = torch.rand((4, 4), dtype=torch.float32).npu()
+                torch_npu._npu_matmul_add_fp32(x, weight, c)
+        except Exception as e:
+            logger.warning_once("ATB warmup skipped: %s", e)
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()

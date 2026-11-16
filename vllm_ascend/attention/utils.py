@@ -228,6 +228,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # CPU tensor of sequence lengths for host-side operations.
     # E.g., tensor([128, 256, 64]) for 3 requests with different seq lengths.
     seq_lens_cpu: torch.Tensor = None
+    _seq_lens_cpu: torch.Tensor | None = None
+    _num_computed_tokens_cpu: torch.Tensor | None = None
+    seq_lens_cpu_upper_bound: torch.Tensor | None = None
+    is_prefilling: Any = None
+    mm_req_doc_ranges: Any = None
+    dcp_local_seq_lens_cpu: torch.Tensor | None = None
 
     # Host mirror of this cache group's block table, including padded rows.
 
@@ -270,9 +276,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.
-        # Helper to slice optional per-request tensors to ``num_actual_reqs``.
         def _slice_reqs(x):
-            return x[:num_actual_reqs] if x is not None else None
+            if x is None:
+                return None
+            if hasattr(x, "__getitem__"):
+                return x[:num_actual_reqs]
+            return x
 
         return AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc[: num_actual_reqs + 1],

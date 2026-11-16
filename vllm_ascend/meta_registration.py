@@ -49,7 +49,12 @@ def register_meta_if_necessary(ns: str, op_name: str, fn, overload: str = ""):
     meta_impl_list = torch._C._dispatch_get_registrations_for_dispatch_key("Meta")
     if schema_to_find in meta_impl_list:
         return
-    lib.impl(op_name, fn, "Meta")
+    try:
+        lib.impl(op_name, fn, "Meta")
+    except RuntimeError as e:
+        if "does not exist" in str(e) or "Could not find schema" in str(e):
+            return
+        raise
 
 
 def bgmv_expand_meta(

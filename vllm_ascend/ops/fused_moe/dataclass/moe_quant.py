@@ -69,6 +69,10 @@ class MoEQuantParams:
         return self.quant_type == QuantType.W4A8 and self.is_per_channel_weight
 
     @property
+    def is_fp4_a8_int(self) -> bool:
+        return self.quant_type == QuantType.FP4A8INT
+
+    @property
     def dispatch_with_quant(self) -> bool:
         return self.quant_type in (
             QuantType.W8A8,
@@ -77,6 +81,7 @@ class MoEQuantParams:
             QuantType.W4A4MXFP,
             QuantType.W4A8MXFP,
             QuantType.W8A8FP,
+            QuantType.FP4A8INT,
         )
 
     @property

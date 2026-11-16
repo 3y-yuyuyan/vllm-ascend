@@ -35,6 +35,7 @@ from vllm_ascend.models.deepseek_v4.model import (
     DeepseekV4DecoderLayer,
     DeepseekV4MoE,
     get_spec_layer_idx_from_weight_name,
+    _load_buffered_shared_experts,
 )
 from vllm_ascend.utils import enable_dsa_cp
 
@@ -69,10 +70,20 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         quant_config = vllm_config.quant_config
 
         self.e_proj = ReplicatedLinear(
-            config.hidden_size, config.hidden_size, bias=False, quant_config=quant_config, return_bias=False
+            config.hidden_size,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            return_bias=False,
+            prefix=maybe_prefix(prefix, "e_proj"),
         )
         self.h_proj = ReplicatedLinear(
-            config.hidden_size, config.hidden_size, bias=False, quant_config=quant_config, return_bias=False
+            config.hidden_size,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            return_bias=False,
+            prefix=maybe_prefix(prefix, "h_proj"),
         )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -316,6 +327,7 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        shared_experts_buffers: dict[str, torch.Tensor] = {}
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -348,6 +360,10 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
 
             if name.endswith(".scale"):
                 name = name.replace(".scale", ".weight_scale")
+            if name.endswith(".weight_fp4"):
+                name = name.replace(".weight_fp4", ".weight")
+            elif name.endswith("_fp4"):
+                name = name[:-4]
 
             if ".head." in name:
                 name = name.replace(".head.", ".shared_head.head.")
@@ -371,6 +387,8 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                 name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
 
             if "sink" in name:
+                if name not in params_dict:
+                    continue
                 param = params_dict[name]
                 if enable_dsa_cp():
                     param.data.copy_(loaded_weight)
@@ -381,7 +399,10 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                 loaded_params.add(name)
                 continue
 
-            is_fusion_moe_shared_experts_layer = rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
+            is_fusion_moe_shared_experts_layer = rocm_aiter_moe_shared_expert_enabled and ("shared_expert" in name)
+            if "shared_expert" in name and not is_fusion_moe_shared_experts_layer:
+                shared_experts_buffers[name] = loaded_weight.cpu()
+                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
@@ -407,6 +428,9 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
 
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+
+                if name not in params_dict:
                     continue
 
                 param = params_dict[name]
@@ -468,6 +492,9 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                         # Instead, create a new variable
                         name_mapped = chunk_name.replace(weight_name, param_name)
 
+                        if name_mapped not in params_dict:
+                            continue
+
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
@@ -510,11 +537,23 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                         # ):
                         #     continue
 
+                        if name not in params_dict:
+                            head, _, leaf = name.rpartition(".")
+                            suffixed = f"{head}.base_layer.{leaf}"
+                            if suffixed in params_dict:
+                                name = suffixed
+                            else:
+                                continue
+
                         param = params_dict[name]
                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
                         weight_loader(param, loaded_weight)
-            if not is_fusion_moe_shared_experts_layer:
+            if not is_fusion_moe_shared_experts_layer and name in params_dict:
                 loaded_params.add(name)
+
+        if shared_experts_buffers:
+            _load_buffered_shared_experts(shared_experts_buffers, params_dict, loaded_params)
+
         return loaded_params
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:

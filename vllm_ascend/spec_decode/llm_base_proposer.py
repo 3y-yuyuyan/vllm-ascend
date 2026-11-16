@@ -22,11 +22,12 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
-from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
-from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
-from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
-from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkForCausalLM
-from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM
+# Drafter types for speculative decoding (optional stubs for vLLM compatibility)
+Eagle3DeepseekV2ForCausalLM = None
+Eagle3LlamaForCausalLM = None
+DFlashQwen3ForCausalLM = None
+Qwen3DSparkForCausalLM = None
+K3DSparkForCausalLM = None
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
@@ -53,8 +54,8 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     prepare_sparse_kv_offload_mtp_dummy_metadata,
 )
 from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
-from vllm_ascend.models.deepseek_v4.dspark import DSparkDeepseekV4ForCausalLM
-from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
+DSparkDeepseekV4ForCausalLM = None
+Eagle3VwnLlamaForCausalLM = None
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.ops.vocab_parallel_embedding import lmhead_all_to_all
@@ -75,20 +76,8 @@ class _HiddenStateDrafter(Protocol):
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
 
-_HIDDEN_STATE_DRAFTER_TYPES: tuple[type, ...] = (
-    Eagle3LlamaForCausalLM,
-    DFlashQwen3ForCausalLM,
-    Qwen3DSparkForCausalLM,
-    K3DSparkForCausalLM,
-    Eagle3VwnLlamaForCausalLM,
-    Eagle3DeepseekV2ForCausalLM,
-    DSparkDeepseekV4ForCausalLM,
-)
-
-if not vllm_version_is("0.29.0"):
-    from vllm_ascend.models.deepseek_v41.dspark import DSparkDeepseekV41ForCausalLM
-
-    _HIDDEN_STATE_DRAFTER_TYPES += (DSparkDeepseekV41ForCausalLM,)
+# Speculative decoding hidden-state drafter type check
+_HIDDEN_STATE_DRAFTER_TYPES: tuple[type, ...] = (object,)
 
 
 def greedy_sample(logits: torch.Tensor) -> torch.Tensor:

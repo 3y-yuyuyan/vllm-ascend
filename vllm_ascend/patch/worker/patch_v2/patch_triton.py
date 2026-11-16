@@ -10,8 +10,11 @@ from vllm.v1.worker.gpu.sample import (
     prompt_logprob,
     sampler,
     states,
-    thinking_budget,
 )
+try:
+    from vllm.v1.worker.gpu.sample import thinking_budget
+except ImportError:
+    thinking_budget = None
 from vllm.v1.worker.gpu.spec_decode import rejection_sampler, rejection_sampler_utils
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.gpu.spec_decode.dspark import speculator as dspark_speculator
@@ -70,7 +73,8 @@ logprob._fill_logprob_token_ids_kernel = _fill_logprob_token_ids_kernel
 # For now, use the Ascend-specific implementation.
 sampler.get_num_nans = get_num_nans
 rejection_sampler.get_num_nans = get_num_nans
-# TODO: Remove after the new Q4 Triton-Ascend release is available.
-thinking_budget._load_effective_token = _load_effective_token_ascend
-# TODO: Remove after Triton-Ascend 3.6.0 is the minimum supported version.
-thinking_budget._update_committed_marker_cache_kernel = _update_committed_marker_cache_kernel_ascend
+if thinking_budget is not None:
+    # TODO: Remove after the new Q4 Triton-Ascend release is available.
+    thinking_budget._load_effective_token = _load_effective_token_ascend
+    # TODO: Remove after Triton-Ascend 3.6.0 is the minimum supported version.
+    thinking_budget._update_committed_marker_cache_kernel = _update_committed_marker_cache_kernel_ascend

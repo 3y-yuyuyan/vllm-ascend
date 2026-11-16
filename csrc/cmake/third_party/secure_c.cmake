@@ -8,13 +8,20 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 set(_secure_c_url "")
-if(CANN_PKG_SERVER)
+if(EXISTS "${CANN_3RD_LIB_PATH}/pkg/v1.1.16.tar.gz")
+  set(_secure_c_url "file://${CANN_3RD_LIB_PATH}/pkg/v1.1.16.tar.gz")
+elseif(EXISTS "${CANN_3RD_PKG_PATH}/v1.1.16.tar.gz")
+  set(_secure_c_url "file://${CANN_3RD_PKG_PATH}/v1.1.16.tar.gz")
+elseif(EXISTS "${PROJECT_SOURCE_DIR}/third_party/pkg/v1.1.16.tar.gz")
+  set(_secure_c_url "file://${PROJECT_SOURCE_DIR}/third_party/pkg/v1.1.16.tar.gz")
+elseif(CANN_PKG_SERVER)
   set(_secure_c_url "${CANN_PKG_SERVER}/libs/securec/v1.1.10.tar.gz")
+else()
+  set(_secure_c_url "https://gitee.com/openeuler/libboundscheck/repository/archive/v1.1.16.tar.gz")
 endif()
 include(ExternalProject)
 ExternalProject_Add(secure_c
   URL               ${_secure_c_url}
-                    https://gitee.com/openeuler/libboundscheck/repository/archive/v1.1.16.tar.gz
   URL_MD5           ae4865cec1bfb52f7dca03f5c05ac98a
   DOWNLOAD_DIR      download/secure_c
   PREFIX            third_party

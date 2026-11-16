@@ -1469,6 +1469,56 @@ std::tuple<at::Tensor, at::Tensor> npu_dequant_swiglu_quant_meta(
     return {y, scale};
 }
 
+at::Tensor fp4_int8_gmm_v2_meta(
+    const at::Tensor& x, const at::Tensor& weight, const at::Tensor& scales,
+    const at::Tensor& channels, const at::Tensor& token_scales,
+    const at::Tensor& groups, int64_t group_type)
+{
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "fp4_int8_gmm_v2: invalid input ranks");
+    return at::empty({x.size(0), weight.size(1)}, x.options().dtype(at::kBFloat16));
+}
+
+at::Tensor fp4_bf16_gmm_v2_meta(
+    const at::Tensor& x, const at::Tensor& weight, const at::Tensor& scales,
+    const at::Tensor& channels, const at::Tensor& groups, int64_t group_type,
+    double swiglu_limit)
+{
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "fp4_bf16_gmm_v2: invalid input ranks");
+    int64_t n = (swiglu_limit > 0.0) ? weight.size(1) / 2 : weight.size(1);
+    return at::empty({x.size(0), n}, x.options().dtype(at::kBFloat16));
+}
+
+at::Tensor fp4_int8_gmm_v2_cache_meta(
+    const at::Tensor& x, const at::Tensor& weight, const at::Tensor& scales,
+    const at::Tensor& channels, const at::Tensor& token_scales,
+    const at::Tensor& groups, const at::Tensor& int8_cache,
+    const at::Tensor& cache_state, const at::Tensor& cache_timestamps,
+    int64_t group_type, int64_t hit_threshold, int64_t current_step, int64_t num_shared_experts)
+{
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "fp4_int8_gmm_v2_cache: invalid input ranks");
+    return at::empty({x.size(0), weight.size(1)}, x.options().dtype(at::kBFloat16));
+}
+
+at::Tensor fp4_bf16_gmm_v2_cache_meta(
+    const at::Tensor& x, const at::Tensor& weight, const at::Tensor& scales,
+    const at::Tensor& channels, const at::Tensor& groups, const at::Tensor& bf16_cache,
+    const at::Tensor& cache_state, const at::Tensor& cache_timestamps,
+    int64_t group_type, int64_t hit_threshold, int64_t current_step, int64_t num_shared_experts,
+    double swiglu_limit)
+{
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "fp4_bf16_gmm_v2_cache: invalid input ranks");
+    int64_t n = (swiglu_limit > 0.0) ? weight.size(1) / 2 : weight.size(1);
+    return at::empty({x.size(0), n}, x.options().dtype(at::kBFloat16));
+}
+
+at::Tensor fp4_decode_bench_meta(
+    const at::Tensor& weight, const at::Tensor& scales, const at::Tensor& channels, int64_t mode)
+{
+    TORCH_CHECK(weight.dim() == 2, "fp4_decode_bench: invalid input ranks");
+    return at::empty({weight.size(0), weight.size(1) * 2},
+        weight.options().dtype(mode == 1 ? at::kBFloat16 : at::kChar));
+}
+
 at::Tensor npu_lightning_indexer_quant_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
     const at::Tensor &query_dequant_scale, const at::Tensor &key_dequant_scale,
@@ -2172,6 +2222,12 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
      // store_kv_block
     ops.impl("store_kv_block_pre", &vllm_ascend::meta::store_kv_block_metadata);
     ops.impl("store_kv_block", &vllm_ascend::meta::store_kv_block);
+    // FP4 MoE INT8 动态反量化 GEMM 与专家缓存管理算子 Meta 推导注册
+    ops.impl("fp4_int8_gmm_v2", &vllm_ascend::meta::fp4_int8_gmm_v2_meta);
+    ops.impl("fp4_int8_gmm_v2_cache", &vllm_ascend::meta::fp4_int8_gmm_v2_cache_meta);
+    ops.impl("fp4_bf16_gmm_v2", &vllm_ascend::meta::fp4_bf16_gmm_v2_meta);
+    ops.impl("fp4_bf16_gmm_v2_cache", &vllm_ascend::meta::fp4_bf16_gmm_v2_cache_meta);
+    ops.impl("fp4_decode_bench", &vllm_ascend::meta::fp4_decode_bench_meta);
 }
 }
 #endif

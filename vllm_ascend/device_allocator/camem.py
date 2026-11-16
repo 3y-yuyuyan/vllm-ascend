@@ -24,7 +24,10 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
-from acl.rt import memcpy  # type: ignore # noqa: F401
+try:
+    from acl.rt import memcpy  # type: ignore # noqa: F401
+except ImportError:
+    memcpy = None
 from vllm.logger import logger
 
 
@@ -212,6 +215,8 @@ class CaMemAllocator:
                 continue
             handle = data.handle
             if data.tag in offload_tags:
+                if memcpy is None:
+                    raise RuntimeError("acl.rt.memcpy is not available for CaMem sleep mode offloading.")
                 size_in_bytes = handle[1]
                 cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
                 cpu_ptr = cpu_backup_tensor.data_ptr()
@@ -244,6 +249,8 @@ class CaMemAllocator:
                 handle = data.handle
                 create_and_map(handle)
                 if data.cpu_backup_tensor is not None:
+                    if memcpy is None:
+                        raise RuntimeError("acl.rt.memcpy is not available for CaMem wake_up restoration.")
                     cpu_backup_tensor = data.cpu_backup_tensor
                     if cpu_backup_tensor is not None:
                         size_in_bytes = cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()

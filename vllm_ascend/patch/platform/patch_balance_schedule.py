@@ -67,7 +67,17 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.interface import PauseState
-from vllm.v1.core.sched.output import KVConnectorBlockState, NewRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+
+try:
+    from vllm.v1.core.sched.output import KVConnectorBlockState
+except ImportError:
+
+    class KVConnectorBlockState:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs):
+            pass
+
+
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType
@@ -828,7 +838,13 @@ class BalanceScheduler(Scheduler):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
         scheduler_output_kwargs["kv_connector_block_state"] = kv_connector_block_state
-        scheduler_output = SchedulerOutput(**scheduler_output_kwargs)
+        try:
+            scheduler_output = SchedulerOutput(**scheduler_output_kwargs)
+        except TypeError:
+            import inspect
+
+            allowed = inspect.signature(SchedulerOutput).parameters.keys()
+            scheduler_output = SchedulerOutput(**{k: v for k, v in scheduler_output_kwargs.items() if k in allowed})
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store

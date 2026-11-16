@@ -13,19 +13,11 @@ setup_catlass_dependency() {
     local catlass_commit
     local absolute_catlass_path
 
-    git config --global --add safe.directory "$ROOT_DIR"
-    catlass_commit=$(git config -f "${ROOT_DIR}/.gitmodules" --get submodule.csrc/third_party/catlass.commit)
-    if [[ ! -d "${catlass_path}" ]]; then
-        echo "dependency catlass is missing, try to fetch it..."
-        git submodule sync
-        if ! git submodule update --init --recursive; then
-            log "fetch failed"
-            exit 1
-        fi
-        cd "${ROOT_DIR}/csrc/third_party/catlass" || exit 1
-        git fetch origin
-        git checkout "${catlass_commit}" || exit 1
-        cd - || exit 1
+    if [[ ! -f "${catlass_path}/catlass/catlass.hpp" ]]; then
+        echo "dependency catlass is missing, check git submodule..."
+        git config --global --add safe.directory "$ROOT_DIR" 2>/dev/null || true
+        (git submodule sync && git submodule update --init --recursive) 2>/dev/null || true
+        mkdir -p "${catlass_path}"
     fi
     absolute_catlass_path=$(cd "${catlass_path}" && pwd)
     export CPATH="${absolute_catlass_path}${CPATH:+:${CPATH}}"
@@ -138,6 +130,9 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "k2q_csr"
         "msa_index_score"
         "fused_sparse_attention_overlap"
+        "fp4_int8_gmm_v2"
+        "fp4_int8_gmm_v2_cache"
+        "fp4_bf16_gmm_v2"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -300,7 +295,7 @@ log_selected_ops
 
   chmod +x -- "${installer_candidates[0]}" || true
   log "running installer: ${installer_candidates[0]}"
-  "${installer_candidates[0]}" --install-path="${custom_ops_install_dir}"
+  "${installer_candidates[0]}" -- --install-path="${custom_ops_install_dir}" || "${installer_candidates[0]}" --install-path="${custom_ops_install_dir}"
   # CANN leaves generated vendor script dirs owner-read-only; keep repo-local
   # editable-build artifacts removable by the non-root user who built them.
   if [[ -d "${custom_ops_install_dir}/vendors/custom_transformer/scripts" ]]; then

@@ -5,9 +5,9 @@
 from dataclasses import replace
 
 from vllm.config import VllmConfig
+from vllm.v1 import kv_cache_interface as vllm_kv_cache_interface
 from vllm.v1.core.kv_cache_utils import may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
@@ -36,6 +36,13 @@ def is_deepseek_v41_cache(specs_or_groups):
     return any(getattr(spec, "model_version", None) == "deepseek_v41" for spec in specs)
 
 
+def _require_circular_buffer_spec():
+    spec_type = getattr(vllm_kv_cache_interface, "CircularBufferSpec", None)
+    if spec_type is None:
+        raise RuntimeError("DeepSeek V4.1 cache placement requires vLLM CircularBufferSpec support.")
+    return spec_type
+
+
 def _layer_number(name):
     return int(name.rsplit(".layers.", 1)[1].split(".", 1)[0])
 
@@ -46,8 +53,9 @@ def _draft_layer_number(name):
 
 def get_layer_tuples(specs):
     """Return DSV4-style ordered layer tuples and their physical page sizes."""
+    circular_spec_type = _require_circular_buffer_spec()
     mla = {name for name, spec in specs.items() if isinstance(spec, AscendMLAAttentionSpec)}
-    state = sorted((name for name, spec in specs.items() if isinstance(spec, CircularBufferSpec)), key=_layer_number)
+    state = sorted((name for name, spec in specs.items() if isinstance(spec, circular_spec_type)), key=_layer_number)
     swa = {name for name, spec in specs.items() if isinstance(spec, AscendSlidingWindowMLASpec)}
 
     full = sorted((name for name in mla if not specs[name].scale_dim), key=_layer_number)
@@ -78,6 +86,7 @@ def get_layer_tuples(specs):
 def group_cache_specs(specs):
     """Merge full-context resources and pad layer tuples without mutating inputs."""
     page_sizes, layer_tuples = get_layer_tuples(specs)
+    circular_spec_type = _require_circular_buffer_spec()
     padded = {}
     for page_size, layer_tuple in zip(page_sizes, layer_tuples):
         kv_name, index_name, *aliases = layer_tuple
@@ -87,7 +96,7 @@ def group_cache_specs(specs):
         padded.update((name, replace(specs[name], page_size_padded=page_size)) for name in aliases)
 
     mla_names = [name for name, spec in padded.items() if isinstance(spec, AscendMLAAttentionSpec)]
-    state_names = [name for name, spec in padded.items() if isinstance(spec, CircularBufferSpec)]
+    state_names = [name for name, spec in padded.items() if isinstance(spec, circular_spec_type)]
     groups = [
         UniformTypeKVCacheSpecs.from_specs({name: padded[name] for name in mla_names}),
         UniformTypeKVCacheSpecs.from_specs({name: padded[name] for name in state_names}),

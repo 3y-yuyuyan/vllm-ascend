@@ -1,6 +1,9 @@
 import torch
 from torch.overrides import TorchFunctionMode
-from vllm.v1.worker.gpu.spec_decode import adaptive_verification
+try:
+    from vllm.v1.worker.gpu.spec_decode import adaptive_verification
+except ImportError:
+    adaptive_verification = None
 
 
 def _index_fill(tensor, dim, index, value):
@@ -26,7 +29,8 @@ class _IndexFillMode(TorchFunctionMode):
         return func(*args, **kwargs)
 
 
-_original_assign_draft_token_budget = adaptive_verification._assign_draft_token_budget
+if adaptive_verification is not None:
+    _original_assign_draft_token_budget = adaptive_verification._assign_draft_token_budget
 
 
 def _assign_draft_token_budget_ascend(*args, **kwargs):

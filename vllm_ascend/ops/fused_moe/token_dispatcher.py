@@ -377,8 +377,12 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         if with_quant and dynamic_scale is None:
             if quant_type == QuantType.W4A4MXFP:
                 quant_mode = 9
+            elif is_mxfp:
+                from vllm_ascend.device.device_config import get_ascend_device_type
+                from vllm_ascend.device.hardware import AscendDeviceType
+                quant_mode = 3 if get_ascend_device_type() == AscendDeviceType.A5 else -1
             else:
-                quant_mode = 3 if is_mxfp else 1
+                quant_mode = 1
         else:
             quant_mode = -1
 

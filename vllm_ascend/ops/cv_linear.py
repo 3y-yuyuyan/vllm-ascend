@@ -41,7 +41,14 @@ class CVLinearWrapper:
         self._quant_method = linear.quant_method
         self._is_w8a8_dynamic = self._detect_w8a8_dynamic(linear.quant_method)
         self._mxfp8_quant_method = self._detect_mxfp8_dynamic(linear.quant_method)
-        self._is_mxfp8_dynamic = self._mxfp8_quant_method is not None
+
+        # 910B (non-A5) does not support aclnnDynamicMxQuantV2 or MXFP8 npu_quant_matmul
+        from vllm_ascend.device.device_config import get_ascend_device_type
+        from vllm_ascend.device.hardware import AscendDeviceType
+        if get_ascend_device_type() != AscendDeviceType.A5:
+            self._is_mxfp8_dynamic = False
+        else:
+            self._is_mxfp8_dynamic = self._mxfp8_quant_method is not None
 
     @staticmethod
     def _detect_w8a8_dynamic(quant_method):
@@ -109,12 +116,16 @@ class CVLinearWrapper:
             return quantized_x, pertoken_scale
 
         if self._is_mxfp8_dynamic:
-            quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
-                x,
-                dst_type=torch.float8_e4m3fn,
-                scale_alg=self._mxfp8_quant_method.dynamic_mx_quant_scale_alg,
-            )
-            return quantized_x, pertoken_scale
+            try:
+                quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+                    x,
+                    dst_type=torch.float8_e4m3fn,
+                    scale_alg=self._mxfp8_quant_method.dynamic_mx_quant_scale_alg,
+                )
+                return quantized_x, pertoken_scale
+            except Exception:
+                self._is_mxfp8_dynamic = False
+                return x, None
 
         return x, None
 
@@ -153,21 +164,24 @@ class CVLinearWrapper:
                 output = output.unsqueeze(dim=1)
             return output
 
-        if self._is_mxfp8_dynamic:
-            # Mirrors the pre-quantized path of the MXFP8 scheme's apply()
-            if bias is not None and bias.dtype != torch.float32:
-                bias = bias.to(torch.float32)
-            return torch_npu.npu_quant_matmul(
-                quantized_x,
-                self.linear.weight,
-                self.linear.weight_scale,
-                scale_dtype=torch_npu.float8_e8m0fnu,
-                pertoken_scale=pertoken_scale,
-                pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
-                bias=bias,
-                output_dtype=torch.bfloat16,
-                group_sizes=[1, 1, self._mxfp8_quant_method.group_size],
-            )
+        if self._is_mxfp8_dynamic and pertoken_scale is not None:
+            try:
+                # Mirrors the pre-quantized path of the MXFP8 scheme's apply()
+                if bias is not None and bias.dtype != torch.float32:
+                    bias = bias.to(torch.float32)
+                return torch_npu.npu_quant_matmul(
+                    quantized_x,
+                    self.linear.weight,
+                    self.linear.weight_scale,
+                    scale_dtype=torch_npu.float8_e8m0fnu,
+                    pertoken_scale=pertoken_scale,
+                    pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+                    bias=bias,
+                    output_dtype=torch.bfloat16,
+                    group_sizes=[1, 1, self._mxfp8_quant_method.group_size],
+                )
+            except Exception:
+                self._is_mxfp8_dynamic = False
 
         return self.linear.quant_method.apply(self.linear, quantized_x, bias)
 

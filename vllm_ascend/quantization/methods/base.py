@@ -322,6 +322,10 @@ class AscendMoEScheme(ABC):
             QuantType.W4A16MXFP,
         )
         if dynamic_scale is None:
+            from vllm_ascend.device.device_config import get_ascend_device_type
+            from vllm_ascend.device.hardware import AscendDeviceType
+            if get_ascend_device_type() != AscendDeviceType.A5:
+                return hidden_states, None
             # When hidden_states haven't been quanted, we need to quant hidden_states.
             if use_mxfp_quant:
                 hidden_states, dynamic_scale = torch_npu.npu_dynamic_mx_quant(

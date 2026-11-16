@@ -9,9 +9,9 @@ from typing_extensions import Self
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1 import kv_cache_interface as vllm_kv_cache_interface
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheSpec,
     MambaSpec,
@@ -52,7 +52,11 @@ def is_circular_kv_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
     if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
         specs = tuple(kv_cache_spec.kv_cache_specs.values())
         return bool(specs) and all(is_circular_kv_cache_spec(spec) for spec in specs)
-    return isinstance(kv_cache_spec, CircularBufferSpec) or getattr(kv_cache_spec, "is_circular", False)
+    # Older vLLM builds do not export the optional circular-buffer class.
+    circular_spec_type = getattr(vllm_kv_cache_interface, "CircularBufferSpec", None)
+    return (
+        circular_spec_type is not None and isinstance(kv_cache_spec, circular_spec_type)
+    ) or bool(getattr(kv_cache_spec, "is_circular", False))
 
 
 def is_prefix_cacheable(kv_cache_spec: KVCacheSpec) -> bool:

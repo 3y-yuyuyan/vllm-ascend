@@ -39,7 +39,10 @@ def register_deepseek_v4_vision_config_convertor() -> None:
                 hf_config.architectures = ["DeepseekV4ForConditionalGeneration"]
                 hf_config.mm_prefix_clamp_sliding_window = True
                 hf_config.mm_prefix_span_leading_pad_modulus = 4
-            super().__init__(hf_config, hf_text_config, revision)
+            try:
+                super().__init__(hf_config, hf_text_config, revision)
+            except TypeError:
+                super().__init__(hf_config, hf_text_config)
 
         def is_mm_prefix_lm(self, supports_multimodal: bool = True) -> bool:
             return supports_multimodal and (getattr(self.hf_config, "vision_n_layers", 0) > 0)

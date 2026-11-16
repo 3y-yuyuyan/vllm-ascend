@@ -221,6 +221,21 @@ function(gen_cust_aicpu_json_symbol)
 endfunction()
 
 function(gen_cust_aicpu_kernel_symbol)
+  # FP4_NATIVE_V2_BUILDFIX1: restrict cached objects to current targets.
+  # AICPU_CUST_OBJ_TARGETS is cached across CMake configurations. A subset
+  # build can therefore inherit names from an earlier full build. Derive
+  # both TARGET_OBJECTS and DEPENDS from targets created in this configure.
+  set(_fp4_current_aicpu_targets "")
+  foreach(_fp4_aicpu_target IN LISTS AICPU_CUST_OBJ_TARGETS)
+    if(TARGET "${_fp4_aicpu_target}")
+      list(APPEND _fp4_current_aicpu_targets "${_fp4_aicpu_target}")
+    else()
+      message(STATUS "Ignoring stale cached AICPU object target: ${_fp4_aicpu_target}")
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES _fp4_current_aicpu_targets)
+  set(AICPU_CUST_OBJ_TARGETS "${_fp4_current_aicpu_targets}")
+
   if(NOT AICPU_CUST_OBJ_TARGETS)
     message(STATUS "No aicpu cust obj targets found, skipping.")
     return()

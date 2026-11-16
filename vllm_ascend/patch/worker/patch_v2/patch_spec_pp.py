@@ -11,7 +11,10 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+try:
+    from vllm.utils.torch_utils import async_tensor_h2d as async_copy_to_gpu
+except ImportError:
+    from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 
 _INSTALLED = "_vllm_ascend_upstream_spec_pp_installed"
 

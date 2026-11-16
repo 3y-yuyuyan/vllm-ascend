@@ -93,11 +93,23 @@ from vllm.v1.outputs import (
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
-    RoutedExpertsLists,
-    RoutedExpertsTensors,
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
+
+try:
+    from vllm.v1.outputs import RoutedExpertsLists, RoutedExpertsTensors
+except ImportError:
+    from typing import NamedTuple
+
+    class RoutedExpertsLists(NamedTuple):  # type: ignore[no-redef]
+        routing_data: Any
+        slot_mapping: Any
+
+    class RoutedExpertsTensors(NamedTuple):  # type: ignore[no-redef]
+        routing_data: Any
+        slot_mapping: Any
+
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSampler
@@ -109,13 +121,34 @@ from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_model_runner import (
     AsyncGPUModelRunnerOutput,
     GPUModelRunner,
-    nans_to_dict,
 )
+try:
+    from vllm.v1.worker.gpu_model_runner import nans_to_dict
+except ImportError:
+    def nans_to_dict(counts: list[int], req_id_to_index: dict[str, int]) -> dict[str, int]:
+        return {
+            req_id: int(counts[i]) if i < len(counts) else 0
+            for req_id, i in req_id_to_index.items()
+        }
+
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     maybe_create_ubatch_slices,
 )
-from vllm.v1.worker.utils import AttentionGroup, raise_if_nan_logits, select_common_block_size
+from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
+try:
+    from vllm.v1.worker.utils import raise_if_nan_logits
+except ImportError:
+    from collections.abc import Mapping
+    def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
+        if not any(num_nans_in_logits.values()):
+            return
+        corrupted_requests = {
+            req_id: num_nans
+            for req_id, num_nans in num_nans_in_logits.items()
+            if num_nans > 0
+        }
+        raise RuntimeError(f"NaNs detected in logits: {corrupted_requests}")
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
@@ -270,13 +303,16 @@ from vllm_ascend.core.profiling_chunk_predictor import (
 v41_metadata_builder_type: type | tuple[()] = ()
 v41_cache_layer_type: type | tuple[()] = ()
 if not vllm_version_is("0.29.0"):
-    from vllm_ascend.attention.dsa_v41 import (
-        AscendDSAV41MetadataBuilder,
-        DeepseekV41CacheLayer,
-    )
+    try:
+        from vllm_ascend.attention.dsa_v41 import (
+            AscendDSAV41MetadataBuilder,
+            DeepseekV41CacheLayer,
+        )
 
-    v41_metadata_builder_type = AscendDSAV41MetadataBuilder
-    v41_cache_layer_type = DeepseekV41CacheLayer
+        v41_metadata_builder_type = AscendDSAV41MetadataBuilder
+        v41_cache_layer_type = DeepseekV41CacheLayer
+    except Exception:
+        pass
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
@@ -376,6 +412,8 @@ class NPUModelRunner(GPUModelRunner):
 
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+        # Older vLLM runners do not define the optional routing-capture state.
+        self.routed_experts_initialized = getattr(self, "routed_experts_initialized", False)
         self.lookback_token_ids: CpuGpuBuffer | None = None
 
         self.device_metadata_executor: DeviceMetadataExecutor | None = None
@@ -2951,7 +2989,7 @@ class NPUModelRunner(GPUModelRunner):
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
-            routed_experts=routed_experts_snapshot,
+            **({"routed_experts": routed_experts_snapshot} if routed_experts_snapshot is not None else {}),
             num_nans=num_nans_device,
         )
         self.input_batch.set_async_sampled_token_ids(
@@ -3571,7 +3609,7 @@ class NPUModelRunner(GPUModelRunner):
                 # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
                 slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
                 blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
-            if self.model_config.enable_return_routed_experts and kv_cache_gid == 0:
+            if getattr(self.model_config, "enable_return_routed_experts", False) and kv_cache_gid == 0:
                 if self.routed_experts_initialized:
                     # snapshot slot_mapping into a private device
                     # buffer so the next ``_prepare_inputs`` does not
@@ -3650,20 +3688,13 @@ class NPUModelRunner(GPUModelRunner):
                     req_idx = self.input_batch.req_id_to_index[req_id]
                     req_doc_ranges[req_idx] = image_doc_ranges
 
-        cm_base = AscendCommonAttentionMetadata(
+        cm_kwargs = dict(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
             seq_lens=self.seq_lens[:num_reqs_padded],
-            # Always pass optimistic_seq_lens_cpu via _seq_lens_cpu so NPU
-            # attention backends can get CPU seq_lens without GPU->CPU sync.
-            # This is separate from seq_lens_cpu (None in async) which eagle
-            # proposer checks to distinguish async/non-async behavior.
             _seq_lens_cpu=self.optimistic_seq_lens_cpu[:num_reqs_padded],
             seq_lens_cpu_upper_bound=self.optimistic_seq_lens_cpu[:num_reqs_padded],
-            # TODO
             seq_lens_cpu=seq_lens_cpu,
-            # TODO
-            # num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs_padded],
             num_computed_tokens_cpu=num_computed_tokens_cpu,
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens,
@@ -3680,9 +3711,9 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
             context_parallel_metadata=self.long_seq_metadata,
-            group_len = self.group_len.gpu[:num_reqs_padded],
-            group_key_idx = self.group_key_idx.gpu[:num_reqs_padded],
-            group_key_cache_idx = self.group_key_cache_idx.gpu[:num_reqs_padded],
+            group_len=self.group_len.gpu[:num_reqs_padded],
+            group_key_idx=self.group_key_idx.gpu[:num_reqs_padded],
+            group_key_cache_idx=self.group_key_cache_idx.gpu[:num_reqs_padded],
             req_ids_tensor=(
                 self._offload_req_ids_tensor.gpu[:num_reqs_padded]
                 if self._offload_req_ids_tensor is not None
@@ -3695,6 +3726,26 @@ class NPUModelRunner(GPUModelRunner):
             ),
             mm_req_doc_ranges=req_doc_ranges,
         )
+
+        import dataclasses
+        import inspect
+        if dataclasses.is_dataclass(AscendCommonAttentionMetadata):
+            valid_fields = {f.name for f in dataclasses.fields(AscendCommonAttentionMetadata)}
+        else:
+            try:
+                sig = inspect.signature(AscendCommonAttentionMetadata.__init__)
+                valid_fields = set(sig.parameters.keys()) - {"self"}
+            except Exception:
+                valid_fields = set(cm_kwargs.keys())
+
+        filtered_kwargs = {k: v for k, v in cm_kwargs.items() if k in valid_fields}
+        extra_kwargs = {k: v for k, v in cm_kwargs.items() if k not in valid_fields}
+        cm_base = AscendCommonAttentionMetadata(**filtered_kwargs)
+        for k, v in extra_kwargs.items():
+            try:
+                setattr(cm_base, k, v)
+            except Exception:
+                pass
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
@@ -4622,7 +4673,7 @@ class NPUModelRunner(GPUModelRunner):
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
 
-        if self.model_config.enable_return_routed_experts:
+        if getattr(self.model_config, "enable_return_routed_experts", False):
             self.init_routed_experts_capturer()
 
         self.kvpp = KVPPRuntime.create_from_kv_cache(

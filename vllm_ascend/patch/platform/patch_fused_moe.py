@@ -47,7 +47,7 @@ from vllm_ascend.ops.fused_moe.router.router_factory import create_ascend_fused_
 _EPLB_ROUTER_ADAPTED = "_vllm_ascend_eplb_router_adapted"
 
 # Capture the real original before fused_moe.py's module-level code runs.
-_original_FusedMoE = _fused_moe_layer.FusedMoEFactory
+_original_FusedMoE = getattr(_fused_moe_layer, "FusedMoEFactory", None) or getattr(_fused_moe_layer, "FusedMoE", None)
 
 
 @cache
@@ -211,6 +211,10 @@ def _ascend_FusedMoE(
 
 _fused_moe_layer.FusedMoEFactory = _ascend_FusedMoE
 _fused_moe_pkg.FusedMoEFactory = _ascend_FusedMoE
+if hasattr(_fused_moe_layer, "FusedMoE"):
+    _fused_moe_layer.FusedMoE = _ascend_FusedMoE
+if hasattr(_fused_moe_pkg, "FusedMoE"):
+    _fused_moe_pkg.FusedMoE = _ascend_FusedMoE
 
 
 for module_name, module in list(sys.modules.items()):
@@ -218,3 +222,5 @@ for module_name, module in list(sys.modules.items()):
         continue
     if module.__dict__.get("FusedMoEFactory") is _original_FusedMoE:
         module.__dict__["FusedMoEFactory"] = _ascend_FusedMoE
+    if module.__dict__.get("FusedMoE") is _original_FusedMoE:
+        module.__dict__["FusedMoE"] = _ascend_FusedMoE

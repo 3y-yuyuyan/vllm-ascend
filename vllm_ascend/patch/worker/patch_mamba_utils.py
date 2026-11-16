@@ -15,7 +15,13 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
-from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+try:
+    from vllm.v1.worker.gpu_input_batch import InputBatch as GPUInputBatch
+except ImportError:
+    try:
+        from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+    except ImportError:
+        GPUInputBatch = Any
 from vllm.v1.worker.mamba_utils import MambaCopyBuffers
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile

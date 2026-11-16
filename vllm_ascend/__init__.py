@@ -63,6 +63,43 @@ def _ensure_global_patch():
     if _GLOBAL_PATCH_APPLIED:
         return
 
+    try:
+        import vllm.v1.core.sched.output as _vllm_sched_out
+
+        if not hasattr(_vllm_sched_out, "KVConnectorBlockState"):
+
+            class KVConnectorBlockState:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+            _vllm_sched_out.KVConnectorBlockState = KVConnectorBlockState
+    except Exception:
+        pass
+
+    try:
+        import sys
+        import types
+
+        if "vllm.v1.attention.ops.pcp" not in sys.modules:
+            try:
+                import vllm.v1.attention.ops.pcp  # noqa: F401
+            except ImportError:
+                try:
+                    import vllm.model_executor.layers.attention.pcp as _pcp
+
+                    if "vllm.v1.attention.ops" not in sys.modules:
+                        _ops = types.ModuleType("vllm.v1.attention.ops")
+                        sys.modules["vllm.v1.attention.ops"] = _ops
+                        if "vllm.v1.attention" in sys.modules:
+                            sys.modules["vllm.v1.attention"].ops = _ops
+                    sys.modules["vllm.v1.attention.ops.pcp"] = _pcp
+                    if "vllm.v1.attention.ops" in sys.modules:
+                        sys.modules["vllm.v1.attention.ops"].pcp = _pcp
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     from vllm_ascend.utils import adapt_patch
 
     adapt_patch(is_global_patch=True)

@@ -5,7 +5,19 @@
 import torch
 from torch import nn
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.v1.kv_cache_interface import CircularBufferSpec
+try:
+    try:
+    try:
+    try:
+    from vllm.v1.kv_cache_interface import CircularBufferSpec
+except ImportError:
+    CircularBufferSpec = None
+except ImportError:
+    CircularBufferSpec = None
+except ImportError:
+    CircularBufferSpec = None
+except ImportError:
+    CircularBufferSpec = None
 
 from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheLayer
 from vllm_ascend.models.deepseek_v41.cache_config import STATE_RING_ROWS

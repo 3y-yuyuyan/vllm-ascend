@@ -59,6 +59,11 @@
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
 #include "moe/dequant_situ_quant/dequant_situ_quant_torch_adpt.h"
 #include "moe/situ_mx_quant/situ_mx_quant_torch_adpt.h"
+#include "moe/fp4_int8_gmm_v2/fp4_int8_gmm_v2_torch_adpt.h"
+#include "moe/fp4_int8_gmm_v2_cache/fp4_int8_gmm_v2_cache_torch_adpt.h"
+#include "moe/fp4_bf16_gmm_v2/fp4_bf16_gmm_v2_torch_adpt.h"
+#include "moe/fp4_bf16_gmm_v2_cache/fp4_bf16_gmm_v2_cache_torch_adpt.h"
+#include "moe/fp4_decode_bench/fp4_decode_bench_torch_adpt.h"
 #include "attention/mla_prolog_v3_k3/mla_prolog_v3_k3_torch_adpt.h"
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
@@ -2876,6 +2881,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def("swap_blocks(Tensor! x, Tensor! y, Tensor z) -> ()");
     ops.impl("swap_blocks", torch::kPrivateUse1, &vllm_ascend::swap_blocks);
+#else
+    // Fallback schema declarations when direct kernels are disabled
+    ops.def(
+        "bgmv_expand(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y,"
+        " int slice_offset, int slice_size) -> Tensor");
+    ops.def(
+        "sgmv_expand(Tensor! x, Tensor! weight, Tensor! lora_indices, Tensor! seq_len, Tensor! y,"
+        " int slice_offset, int slice_size) -> Tensor");
 #endif
 
     // K3 MLA prolog uses a distinct ACLNN/operator name to keep CANN's MlaPrologV3 available.
@@ -3609,5 +3622,28 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("npu_fused_sparse_attention_overlap", torch::kPrivateUse1,
              &vllm_ascend::npu_fused_sparse_attention_overlap);
+
+    ops.def("fp4_int8_gmm_v2(Tensor x, Tensor weight, Tensor scales, Tensor channels, "
+            "Tensor token_scales, Tensor groups, int group_type=0) -> Tensor");
+    ops.impl("fp4_int8_gmm_v2", torch::kPrivateUse1, &vllm_ascend::fp4_int8_gmm_v2);
+
+    ops.def("fp4_int8_gmm_v2_cache(Tensor x, Tensor weight, Tensor scales, Tensor channels, "
+            "Tensor token_scales, Tensor groups, Tensor int8_cache, Tensor cache_state, "
+            "Tensor cache_timestamps, int group_type=0, int hit_threshold=1, "
+            "int current_step=0, int num_shared_experts=0) -> Tensor");
+    ops.impl("fp4_int8_gmm_v2_cache", torch::kPrivateUse1, &vllm_ascend::fp4_int8_gmm_v2_cache);
+
+    ops.def("fp4_bf16_gmm_v2(Tensor x, Tensor weight, Tensor scales, Tensor channels, "
+            "Tensor groups, int group_type=0, float swiglu_limit=0.0) -> Tensor");
+    ops.impl("fp4_bf16_gmm_v2", torch::kPrivateUse1, &vllm_ascend::fp4_bf16_gmm_v2);
+
+    ops.def("fp4_bf16_gmm_v2_cache(Tensor x, Tensor weight, Tensor scales, Tensor channels, "
+            "Tensor groups, Tensor bf16_cache, Tensor cache_state, Tensor cache_timestamps, "
+            "int group_type=0, int hit_threshold=1, int current_step=0, "
+            "int num_shared_experts=0, float swiglu_limit=0.0) -> Tensor");
+    ops.impl("fp4_bf16_gmm_v2_cache", torch::kPrivateUse1, &vllm_ascend::fp4_bf16_gmm_v2_cache);
+
+    ops.def("fp4_decode_bench(Tensor weight, Tensor scales, Tensor channels, int mode=0) -> Tensor");
+    ops.impl("fp4_decode_bench", torch::kPrivateUse1, &vllm_ascend::fp4_decode_bench);
 }
 #endif

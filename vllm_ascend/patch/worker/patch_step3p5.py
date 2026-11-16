@@ -46,7 +46,13 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.logger import logger
-from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+try:
+    from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+except ImportError:
+    try:
+        from vllm.model_executor.layers.fused_moe import FusedMoE as FusedMoEFactory
+    except ImportError:
+        FusedMoEFactory = None
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.models.step3p5 import (
     FP32ReplicatedLinear,

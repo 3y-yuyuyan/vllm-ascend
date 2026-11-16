@@ -104,6 +104,11 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
         cache_config: CacheConfig,
         compress_ratio: int = 1,
     ):
+        # BaseDeviceAdaptor writes INT8 keys with separate FP16 scales on
+        # A2/A3. The upstream indexer_kv_dtype default can resolve to BF16,
+        # which would allocate a cache incompatible with those scatter writes.
+        if not get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE):
+            dtype = torch.int8
         super().__init__(head_dim, dtype, prefix, cache_config, compress_ratio)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
