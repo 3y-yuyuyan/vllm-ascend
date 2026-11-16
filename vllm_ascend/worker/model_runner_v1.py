@@ -96,6 +96,20 @@ from vllm.v1.outputs import (
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
+
+try:
+    from vllm.v1.outputs import RoutedExpertsLists, RoutedExpertsTensors
+except ImportError:
+    from typing import NamedTuple
+
+    class RoutedExpertsLists(NamedTuple):  # type: ignore[no-redef]
+        routing_data: Any
+        slot_mapping: Any
+
+    class RoutedExpertsTensors(NamedTuple):  # type: ignore[no-redef]
+        routing_data: Any
+        slot_mapping: Any
+
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSampler
@@ -107,8 +121,16 @@ from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_model_runner import (
     AsyncGPUModelRunnerOutput,
     GPUModelRunner,
-    nans_to_dict,
 )
+try:
+    from vllm.v1.worker.gpu_model_runner import nans_to_dict
+except ImportError:
+    def nans_to_dict(counts: list[int], req_id_to_index: dict[str, int]) -> dict[str, int]:
+        return {
+            req_id: int(counts[i]) if i < len(counts) else 0
+            for req_id, i in req_id_to_index.items()
+        }
+
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     maybe_create_ubatch_slices,
@@ -385,6 +407,8 @@ class NPUModelRunner(GPUModelRunner):
 
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+        # Older vLLM runners do not define the optional routing-capture state.
+        self.routed_experts_initialized = getattr(self, "routed_experts_initialized", False)
         self.lookback_token_ids: CpuGpuBuffer | None = None
 
         self.device_metadata_executor: DeviceMetadataExecutor | None = None
@@ -3655,20 +3679,13 @@ class NPUModelRunner(GPUModelRunner):
                     req_idx = self.input_batch.req_id_to_index[req_id]
                     req_doc_ranges[req_idx] = image_doc_ranges
 
-        cm_base = AscendCommonAttentionMetadata(
+        cm_kwargs = dict(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
             seq_lens=self.seq_lens[:num_reqs_padded],
-            # Always pass optimistic_seq_lens_cpu via _seq_lens_cpu so NPU
-            # attention backends can get CPU seq_lens without GPU->CPU sync.
-            # This is separate from seq_lens_cpu (None in async) which eagle
-            # proposer checks to distinguish async/non-async behavior.
             _seq_lens_cpu=self.optimistic_seq_lens_cpu[:num_reqs_padded],
             seq_lens_cpu_upper_bound=self.optimistic_seq_lens_cpu[:num_reqs_padded],
-            # TODO
             seq_lens_cpu=seq_lens_cpu,
-            # TODO
-            # num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs_padded],
             num_computed_tokens_cpu=num_computed_tokens_cpu,
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens,

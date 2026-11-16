@@ -25,7 +25,13 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
-from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
+try:
+    from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
+except ImportError:
+    try:
+        from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs  # type: ignore[no-redef]
+    except ImportError:
+        _gather_prefill_cache_inputs = None  # type: ignore[assignment]
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.ascend_config import get_ascend_config

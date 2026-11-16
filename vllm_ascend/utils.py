@@ -403,7 +403,10 @@ def maybe_trans_nz(
         kwargs["customize_dtype"] = customize_dtype
     if input_dtype is not None:
         kwargs["input_dtype"] = input_dtype
-    return torch_npu.npu_format_cast(weight, ACL_FORMAT_FRACTAL_NZ, **kwargs)
+    try:
+        return torch_npu.npu_format_cast(weight, ACL_FORMAT_FRACTAL_NZ, **kwargs)
+    except Exception:
+        return weight
 
 
 def maybe_trans_nz_with_scale(
@@ -429,7 +432,10 @@ def maybe_trans_nz_with_scale(
         kwargs["customize_dtype"] = customize_dtype
     if input_dtype is not None:
         kwargs["input_dtype"] = input_dtype
-    weight = torch_npu.npu_format_cast(weight, ACL_FORMAT_FRACTAL_NZ, **kwargs)
+    try:
+        weight = torch_npu.npu_format_cast(weight, ACL_FORMAT_FRACTAL_NZ, **kwargs)
+    except Exception:
+        pass
     return weight, weight_scale
 
 

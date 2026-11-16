@@ -12,8 +12,11 @@ from vllm.v1.worker.gpu.sample import (
     prompt_logprob,
     sampler,
     states,
-    thinking_budget,
 )
+try:
+    from vllm.v1.worker.gpu.sample import thinking_budget
+except ImportError:
+    thinking_budget = None
 from vllm.v1.worker.gpu.spec_decode import rejection_sampler, rejection_sampler_utils
 from vllm.v1.worker.gpu.spec_decode.dspark import speculator as dspark_speculator
 from vllm.v1.worker.gpu.spec_decode.eagle import speculator

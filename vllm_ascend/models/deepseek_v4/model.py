@@ -1040,6 +1040,275 @@ class DeepseekV2MixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
+FP4_E2M1_VALS_TABLE = torch.tensor([
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+], dtype=torch.float32)
+
+
+def _unpack_fp4_to_float(packed: torch.Tensor, scale_e8m0: torch.Tensor = None, block_size: int = 32) -> torch.Tensor:
+    lut = FP4_E2M1_VALS_TABLE.to(device=packed.device)
+    low = (packed & 0x0F).long()
+    high = ((packed >> 4) & 0x0F).long()
+    v0 = lut[low]
+    v1 = lut[high]
+    unpacked = torch.stack([v0, v1], dim=-1).reshape(*packed.shape[:-1], packed.shape[-1] * 2)
+    if scale_e8m0 is not None:
+        scale_val = torch.where(
+            scale_e8m0 == 0,
+            torch.zeros_like(scale_e8m0, dtype=torch.float32),
+            2.0 ** (scale_e8m0.to(torch.float32) - 127.0)
+        )
+        scale_expanded = scale_val.repeat_interleave(block_size, dim=-1)
+        if scale_expanded.shape[-1] > unpacked.shape[-1]:
+            scale_expanded = scale_expanded[..., :unpacked.shape[-1]]
+        elif scale_expanded.shape[-1] < unpacked.shape[-1]:
+            unpacked = unpacked[..., :scale_expanded.shape[-1]]
+        unpacked = unpacked * scale_expanded
+    return unpacked
+
+
+def _quant_to_linear_block(w: torch.Tensor, target_dtype: torch.dtype, block_size: int = 128):
+    M, K = w.shape
+    pad_m = (block_size - (M % block_size)) % block_size
+    pad_k = (block_size - (K % block_size)) % block_size
+    if pad_m > 0 or pad_k > 0:
+        w_padded = torch.nn.functional.pad(w, (0, pad_k, 0, pad_m))
+    else:
+        w_padded = w
+    PM, PK = w_padded.shape
+    w_blocks = w_padded.view(PM // block_size, block_size, PK // block_size, block_size).permute(0, 2, 1, 3)
+    max_val = w_blocks.abs().amax(dim=(-2, -1), keepdim=True)
+    if target_dtype == torch.int8:
+        scale = (max_val / 127.0).clamp(min=1e-12)
+        w_quant = (w_blocks / scale).round().clamp(-128.0, 127.0).to(torch.int8)
+    elif target_dtype == torch.float8_e4m3fn:
+        exp = torch.ceil(torch.log2(torch.clamp(max_val / 448.0, min=1e-12))) + 127.0
+        scale = 2.0 ** (torch.clamp(exp, min=0.0, max=254.0) - 127.0)
+        w_quant = (w_blocks / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    else:
+        return w.to(target_dtype), None
+    w_out = w_quant.permute(0, 2, 1, 3).reshape(PM, PK)[:M, :K]
+    scale_out = scale.squeeze(-1).squeeze(-1).to(torch.float32)
+    return w_out, scale_out
+
+
+def _first_tensor(d: dict, *keys):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+        alt_k = k.replace(".shared_experts.", ".shared_expert.") if ".shared_experts." in k else k.replace(".shared_expert.", ".shared_experts.")
+        if alt_k in d and d[alt_k] is not None:
+            return d[alt_k]
+    return None
+
+
+def _load_buffered_shared_experts(se_buffers: dict[str, torch.Tensor], params_dict: dict[str, torch.nn.Parameter], loaded_params: set[str]):
+    from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_size = get_tensor_model_parallel_world_size()
+
+    prefixes = set()
+    for k in se_buffers:
+        for needle in ("shared_experts", "shared_expert"):
+            idx = k.find(needle)
+            if idx != -1:
+                prefixes.add(k[:idx + len(needle)])
+                break
+
+    for prefix in sorted(prefixes):
+        # 1. Gate proj
+        w_gate = _first_tensor(
+            se_buffers,
+            f"{prefix}.gate_proj.weight",
+            f"{prefix}.gate_proj.weight_fp4",
+            f"{prefix}.w1.weight",
+            f"{prefix}.w1.weight_fp4",
+        )
+        s_gate = _first_tensor(
+            se_buffers,
+            f"{prefix}.gate_proj.weight_scale",
+            f"{prefix}.gate_proj.scale",
+            f"{prefix}.w1.weight_scale",
+            f"{prefix}.w1.scale",
+        )
+
+        # 2. Up proj
+        w_up = _first_tensor(
+            se_buffers,
+            f"{prefix}.up_proj.weight",
+            f"{prefix}.up_proj.weight_fp4",
+            f"{prefix}.w3.weight",
+            f"{prefix}.w3.weight_fp4",
+        )
+        s_up = _first_tensor(
+            se_buffers,
+            f"{prefix}.up_proj.weight_scale",
+            f"{prefix}.up_proj.scale",
+            f"{prefix}.w3.weight_scale",
+            f"{prefix}.w3.scale",
+        )
+
+        # 3. Fused gate_up_proj
+        w_gu = _first_tensor(
+            se_buffers,
+            f"{prefix}.gate_up_proj.weight",
+            f"{prefix}.gate_up_proj.weight_fp4",
+        )
+        s_gu = _first_tensor(
+            se_buffers,
+            f"{prefix}.gate_up_proj.weight_scale",
+            f"{prefix}.gate_up_proj.scale",
+        )
+
+        # 4. Down proj
+        w_down = _first_tensor(
+            se_buffers,
+            f"{prefix}.down_proj.weight",
+            f"{prefix}.down_proj.weight_fp4",
+            f"{prefix}.w2.weight",
+            f"{prefix}.w2.weight_fp4",
+        )
+        s_down = _first_tensor(
+            se_buffers,
+            f"{prefix}.down_proj.weight_scale",
+            f"{prefix}.down_proj.scale",
+            f"{prefix}.w2.weight_scale",
+            f"{prefix}.w2.scale",
+        )
+
+        # Unpack if packed FP4 (uint8)
+        if w_gate is not None and w_gate.dtype == torch.uint8:
+            w_gate = _unpack_fp4_to_float(w_gate, s_gate)
+        elif w_gate is not None:
+            w_gate = w_gate.float()
+
+        if w_up is not None and w_up.dtype == torch.uint8:
+            w_up = _unpack_fp4_to_float(w_up, s_up)
+        elif w_up is not None:
+            w_up = w_up.float()
+
+        if w_gu is not None and w_gu.dtype == torch.uint8:
+            w_gu = _unpack_fp4_to_float(w_gu, s_gu)
+        elif w_gu is not None:
+            w_gu = w_gu.float()
+
+        if w_down is not None and w_down.dtype == torch.uint8:
+            w_down = _unpack_fp4_to_float(w_down, s_down)
+        elif w_down is not None:
+            w_down = w_down.float()
+
+        # Load gate_up_proj
+        param_gu_w = _first_tensor(params_dict, f"{prefix}.gate_up_proj.weight", f"{prefix}.w13.weight")
+        param_gu_s = _first_tensor(params_dict, f"{prefix}.gate_up_proj.weight_scale", f"{prefix}.w13.weight_scale")
+
+        if param_gu_w is not None:
+            loader = getattr(param_gu_w, "weight_loader", None)
+            target_dtype = param_gu_w.dtype
+            if w_gu is not None:
+                w_gu_out, s_gu_out = _quant_to_linear_block(w_gu, target_dtype)
+                loaded_ok = False
+                if loader:
+                    try:
+                        loader(param_gu_w, w_gu_out)
+                        loaded_ok = True
+                    except Exception:
+                        loaded_ok = False
+                if not loaded_ok:
+                    shard_sz = param_gu_w.shape[0]
+                    start = tp_rank * shard_sz
+                    with torch.no_grad():
+                        param_gu_w.data.copy_(w_gu_out[start:start + shard_sz].to(param_gu_w.dtype))
+
+                if param_gu_s is not None and s_gu_out is not None:
+                    scale_ok = False
+                    if hasattr(param_gu_s, "weight_loader"):
+                        try:
+                            param_gu_s.weight_loader(param_gu_s, s_gu_out)
+                            scale_ok = True
+                        except Exception:
+                            scale_ok = False
+                    if not scale_ok:
+                        s_shard = param_gu_s.shape[0]
+                        s_start = tp_rank * s_shard
+                        with torch.no_grad():
+                            param_gu_s.data.copy_(s_gu_out[s_start:s_start + s_shard].to(param_gu_s.dtype))
+
+            elif w_gate is not None and w_up is not None:
+                w_g_out, s_g_out = _quant_to_linear_block(w_gate, target_dtype)
+                w_u_out, s_u_out = _quant_to_linear_block(w_up, target_dtype)
+                loaded_ok = False
+                if loader:
+                    try:
+                        loader(param_gu_w, w_g_out, 0)
+                        loader(param_gu_w, w_u_out, 1)
+                        loaded_ok = True
+                    except Exception:
+                        loaded_ok = False
+                if not loaded_ok:
+                    half_shard = param_gu_w.shape[0] // 2
+                    g_shard = w_g_out.shape[0] // tp_size
+                    u_shard = w_u_out.shape[0] // tp_size
+                    with torch.no_grad():
+                        param_gu_w.data[:half_shard].copy_(w_g_out[tp_rank * g_shard : (tp_rank + 1) * g_shard].to(param_gu_w.dtype))
+                        param_gu_w.data[half_shard:].copy_(w_u_out[tp_rank * u_shard : (tp_rank + 1) * u_shard].to(param_gu_w.dtype))
+
+                if param_gu_s is not None and s_g_out is not None and s_u_out is not None:
+                    scale_ok = False
+                    if hasattr(param_gu_s, "weight_loader"):
+                        try:
+                            param_gu_s.weight_loader(param_gu_s, s_g_out, 0)
+                            param_gu_s.weight_loader(param_gu_s, s_u_out, 1)
+                            scale_ok = True
+                        except Exception:
+                            scale_ok = False
+                    if not scale_ok:
+                        s_half = param_gu_s.shape[0] // 2
+                        sg_shard = s_g_out.shape[0] // tp_size
+                        su_shard = s_u_out.shape[0] // tp_size
+                        with torch.no_grad():
+                            param_gu_s.data[:s_half].copy_(s_g_out[tp_rank * sg_shard : (tp_rank + 1) * sg_shard].to(param_gu_s.dtype))
+                            param_gu_s.data[s_half:].copy_(s_u_out[tp_rank * su_shard : (tp_rank + 1) * su_shard].to(param_gu_s.dtype))
+
+            loaded_params.add(f"{prefix}.gate_up_proj.weight")
+
+        # Load down_proj
+        param_d_w = _first_tensor(params_dict, f"{prefix}.down_proj.weight", f"{prefix}.w2.weight")
+        param_d_s = _first_tensor(params_dict, f"{prefix}.down_proj.weight_scale", f"{prefix}.w2.weight_scale")
+
+        if param_d_w is not None and w_down is not None:
+            loader = getattr(param_d_w, "weight_loader", None)
+            target_dtype = param_d_w.dtype
+            w_d_out, s_d_out = _quant_to_linear_block(w_down, target_dtype)
+            loaded_ok = False
+            if loader:
+                try:
+                    loader(param_d_w, w_d_out)
+                    loaded_ok = True
+                except Exception:
+                    loaded_ok = False
+            if not loaded_ok:
+                k_shard = w_d_out.shape[1] // tp_size
+                with torch.no_grad():
+                    param_d_w.data.copy_(w_d_out[:, tp_rank * k_shard : (tp_rank + 1) * k_shard].to(param_d_w.dtype))
+
+            if param_d_s is not None and s_d_out is not None:
+                scale_ok = False
+                if hasattr(param_d_s, "weight_loader"):
+                    try:
+                        param_d_s.weight_loader(param_d_s, s_d_out)
+                        scale_ok = True
+                    except Exception:
+                        scale_ok = False
+                if not scale_ok:
+                    sk_shard = s_d_out.shape[1] // tp_size
+                    with torch.no_grad():
+                        param_d_s.data.copy_(s_d_out[:, tp_rank * sk_shard : (tp_rank + 1) * sk_shard].to(param_d_s.dtype))
+
+            loaded_params.add(f"{prefix}.down_proj.weight")
+
+
 class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts, SupportsLoRA, SupportsEagle3):
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1160,6 +1429,7 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        shared_experts_buffers: dict[str, torch.Tensor] = {}
 
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
@@ -1200,6 +1470,10 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                 name = name.replace(".attn_norm.", ".input_layernorm.")
             if name.endswith(".scale"):
                 name = name.replace(".scale", ".weight_scale")
+            if name.endswith(".weight_fp4"):
+                name = name.replace(".weight_fp4", ".weight")
+            elif name.endswith("_fp4"):
+                name = name[:-4]
 
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1220,6 +1494,8 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             if "sink" in name:
                 if is_pp_missing_parameter(name, self):
                     continue
+                if name not in params_dict:
+                    continue
                 param = params_dict[name]
                 if enable_dsa_cp():
                     param.data.copy_(loaded_weight)
@@ -1230,7 +1506,10 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                 loaded_params.add(name)
                 continue
 
-            is_fusion_moe_shared_experts_layer = rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
+            is_fusion_moe_shared_experts_layer = rocm_aiter_moe_shared_expert_enabled and ("shared_expert" in name)
+            if "shared_expert" in name and not is_fusion_moe_shared_experts_layer:
+                shared_experts_buffers[name] = loaded_weight.cpu()
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
@@ -1260,6 +1539,9 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                     continue
 
                 if is_pp_missing_parameter(name, self):
+                    continue
+
+                if name not in params_dict:
                     continue
 
                 param = params_dict[name]
@@ -1325,6 +1607,9 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
 
+                        if name_mapped not in params_dict:
+                            continue
+
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
@@ -1363,10 +1648,21 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                         if is_pp_missing_parameter(name, self):
                             continue
 
+                        if name not in params_dict:
+                            head, _, leaf = name.rpartition(".")
+                            suffixed = f"{head}.base_layer.{leaf}"
+                            if suffixed in params_dict:
+                                name = suffixed
+                            else:
+                                continue
+
                         param = params_dict[name]
                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
                         weight_loader(param, loaded_weight)
-            if not is_fusion_moe_shared_experts_layer:
+            if not is_fusion_moe_shared_experts_layer and name in params_dict:
                 loaded_params.add(name)
+
+        if shared_experts_buffers:
+            _load_buffered_shared_experts(shared_experts_buffers, params_dict, loaded_params)
 
         return loaded_params

@@ -21,14 +21,20 @@ find_package(Torch REQUIRED)
 
 run_python(TORCH_VERSION
   "import torch; print(torch.__version__)" "Failed to locate torch path")
-# check torch version is 2.10.0
+# check torch version
 if(NOT ${TORCH_VERSION} VERSION_EQUAL "2.10.0")
-  message(FATAL_ERROR "Expected PyTorch version 2.10.0, but found ${TORCH_VERSION}")
+  message(WARNING "Recommended PyTorch version 2.10.0, but found ${TORCH_VERSION}")
 endif()
 
 set(RUN_MODE "npu" CACHE STRING "cpu/sim/npu")
 set(SOC_VERSION ${SOC_VERSION})
 message(STATUS "Detected SOC version: ${SOC_VERSION}")
+
+# FP4_NATIVE_V2_BUILDFIX4: support skipping direct kernels for pure FP4 MoE build
+if(DEFINED ENV{VLLM_ASCEND_SKIP_DIRECT_KERNELS} AND "$ENV{VLLM_ASCEND_SKIP_DIRECT_KERNELS}" STREQUAL "1")
+  set(VLLM_ASCEND_SKIP_DIRECT_KERNELS ON)
+  message(STATUS "VLLM_ASCEND_SKIP_DIRECT_KERNELS=1 detected: will skip vllm_ascend_kernels compile")
+endif()
 
 if (NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE "Release" CACHE STRINGS "Build type Release/Debug (default Release)" FORCE)
@@ -58,7 +64,7 @@ set(VLLM_ASCEND_CUSTOM_OP
     ${KERNEL_FILES}
 )
 
-if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
+if(SOC_VERSION MATCHES "ascend310p.*|ascend950" OR VLLM_ASCEND_SKIP_DIRECT_KERNELS)
     message(STATUS "Hardware ${SOC_VERSION} detected: skip vllm_ascend_kernels compile")
 else()
     ascendc_library(vllm_ascend_kernels SHARED
@@ -84,6 +90,7 @@ if(SOC_VERSION MATCHES "ascend910_93.*")
 endif()
 
 include_directories(
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc
   ${pybind11_INCLUDE_DIRS}
   ${PYTHON_INCLUDE_PATH}
   ${TORCH_INCLUDE_DIRS}
@@ -165,7 +172,7 @@ if(SOC_VERSION MATCHES "ascend310p.*")
     target_compile_definitions(vllm_ascend_C PRIVATE -DASCEND_PLATFORM_310P)
 endif()
 
-if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950"))
+if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950" OR VLLM_ASCEND_SKIP_DIRECT_KERNELS))
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
 endif()
 
@@ -189,7 +196,7 @@ set(VLLM_ASCEND_C_COMMON_LIBS
   opapi
 )
 
-if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
+if(SOC_VERSION MATCHES "ascend310p.*|ascend950" OR VLLM_ASCEND_SKIP_DIRECT_KERNELS)
   target_link_libraries(
     vllm_ascend_C
     PUBLIC
@@ -206,7 +213,7 @@ endif()
 
 target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/custom_transformer/op_api/lib")
 
-if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
+if(SOC_VERSION MATCHES "ascend310p.*|ascend950" OR VLLM_ASCEND_SKIP_DIRECT_KERNELS)
   install(TARGETS vllm_ascend_C DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 else()
   install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})

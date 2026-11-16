@@ -78,6 +78,7 @@ from .cache_config import (
     make_mla_cache_spec,
     make_swa_cache_spec,
 )
+from vllm_ascend.models.deepseek_v4.model import _load_buffered_shared_experts
 from .compressor import DeepseekV41Compressor
 from .engram import (
     create_engram_hash_state,
@@ -1824,6 +1825,7 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        shared_experts_buffers: dict[str, torch.Tensor] = {}
 
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
@@ -1866,6 +1868,10 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
                 name = name.replace(".attn_norm.", ".input_layernorm.")
             if name.endswith(".scale"):
                 name = name.replace(".scale", ".weight_scale")
+            if name.endswith(".weight_fp4"):
+                name = name.replace(".weight_fp4", ".weight")
+            elif name.endswith("_fp4"):
+                name = name[:-4]
 
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1886,6 +1892,8 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
             if "sink" in name:
                 if is_pp_missing_parameter(name, self):
                     continue
+                if name not in params_dict:
+                    continue
                 param = params_dict[name]
                 if enable_dsa_cp():
                     param.data.copy_(loaded_weight)
@@ -1896,7 +1904,10 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
                 loaded_params.add(name)
                 continue
 
-            is_fusion_moe_shared_experts_layer = fuse_shared_experts and ("mlp.shared_experts" in name)
+            is_fusion_moe_shared_experts_layer = fuse_shared_experts and ("shared_expert" in name)
+            if "shared_expert" in name and not is_fusion_moe_shared_experts_layer:
+                shared_experts_buffers[name] = loaded_weight.cpu()
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
@@ -1926,6 +1937,9 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
                     continue
 
                 if is_pp_missing_parameter(name, self):
+                    continue
+
+                if name not in params_dict:
                     continue
 
                 param = params_dict[name]
@@ -1991,6 +2005,9 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
 
+                        if name_mapped not in params_dict:
+                            continue
+
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
@@ -2029,11 +2046,22 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
                         if is_pp_missing_parameter(name, self):
                             continue
 
+                        if name not in params_dict:
+                            head, _, leaf = name.rpartition(".")
+                            suffixed = f"{head}.base_layer.{leaf}"
+                            if suffixed in params_dict:
+                                name = suffixed
+                            else:
+                                continue
+
                         param = params_dict[name]
                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
                         weight_loader(param, loaded_weight)
-            if not is_fusion_moe_shared_experts_layer:
+            if not is_fusion_moe_shared_experts_layer and name in params_dict:
                 loaded_params.add(name)
+
+        if shared_experts_buffers:
+            _load_buffered_shared_experts(shared_experts_buffers, params_dict, loaded_params)
 
         return loaded_params
 

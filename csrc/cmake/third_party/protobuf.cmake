@@ -8,13 +8,22 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 set(_protobuf_url "")
-if(CANN_PKG_SERVER)
+if(EXISTS "${CANN_3RD_LIB_PATH}/pkg/protobuf-25.1.tar.gz")
+  set(_protobuf_url "file://${CANN_3RD_LIB_PATH}/pkg/protobuf-25.1.tar.gz")
+elseif(EXISTS "${CANN_3RD_LIB_PATH}/protobuf/protobuf-all-25.1.tar.gz")
+  set(_protobuf_url "file://${CANN_3RD_LIB_PATH}/protobuf/protobuf-all-25.1.tar.gz")
+elseif(EXISTS "${CANN_3RD_PKG_PATH}/protobuf-25.1.tar.gz")
+  set(_protobuf_url "file://${CANN_3RD_PKG_PATH}/protobuf-25.1.tar.gz")
+elseif(EXISTS "${PROJECT_SOURCE_DIR}/third_party/pkg/protobuf-25.1.tar.gz")
+  set(_protobuf_url "file://${PROJECT_SOURCE_DIR}/third_party/pkg/protobuf-25.1.tar.gz")
+elseif(CANN_PKG_SERVER)
   set(_protobuf_url "${CANN_PKG_SERVER}/libs/protobuf/v25.1.tar.gz")
+else()
+  set(_protobuf_url "https://gitcode.com/cann-src-third-party/protobuf/releases/download/v25.1/protobuf-25.1.tar.gz")
 endif()
 include(ExternalProject)
 ExternalProject_Add(external_protobuf
   URL               ${_protobuf_url}
-                    https://gitcode.com/cann-src-third-party/protobuf/releases/download/v25.1/protobuf-25.1.tar.gz
   DOWNLOAD_DIR      download/protobuf
   PREFIX            third_party
   SOURCE_SUBDIR     cmake

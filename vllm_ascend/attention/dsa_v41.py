@@ -26,7 +26,10 @@ from vllm.v1.attention.backend import (
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-from vllm.v1.kv_cache_interface import CircularBufferSpec
+try:
+    from vllm.v1.kv_cache_interface import CircularBufferSpec
+except ImportError:
+    CircularBufferSpec = ()
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream

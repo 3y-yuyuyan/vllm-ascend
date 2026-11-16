@@ -24,6 +24,7 @@
 #include <dlfcn.h>
 #include <functional>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <torch_npu/csrc/framework/utils/CalcuOpUtil.h>
@@ -648,14 +649,14 @@ void CallRelease(Tuple t, std::index_sequence<I...>) {
 }
 
 template <typename Tuple>
-void ReleaseConvertTypes(Tuple &t) {
+void ReleaseConvertTypes(const Tuple &t) {
   static constexpr auto size = std::tuple_size<Tuple>::value;
   CallRelease(t, std::make_index_sequence<size>{});
 }
 
 template <typename... Ts>
-constexpr auto ConvertTypes(Ts &... args) {
-  return std::make_tuple(ConvertType(args)...);
+constexpr auto ConvertTypes(Ts &&... args) {
+  return std::make_tuple(ConvertType(std::forward<Ts>(args))...);
 }
 
 template <typename Function, typename Tuple, size_t... I>
@@ -735,16 +736,20 @@ typedef void (*ReleaseHugeMem)(void *, bool);
     auto workspace_status = call(getWorkspaceSizeFunc, converted_params);     \
     TORCH_CHECK(workspace_status == 0,                                        \
                 "call " #aclnn_api " failed, detail:", aclGetRecentErrMsg()); \
+    at::Tensor workspace_tensor;                                              \
     void *workspace_addr = nullptr;                                           \
     if (workspace_size != 0) {                                                \
       at::TensorOptions options =                                             \
           at::TensorOptions(torch_npu::utils::get_npu_device_type());         \
-      auto workspace_tensor =                                                 \
-          at::empty({workspace_size}, options.dtype(kByte));                  \
+      workspace_tensor =                                                      \
+          at::empty({static_cast<int64_t>(workspace_size)}, options.dtype(kByte)); \
       workspace_addr = const_cast<void *>(workspace_tensor.storage().data()); \
     }                                                                         \
     auto acl_call = [converted_params, workspace_addr, workspace_size,        \
-                     acl_stream, executor]() -> int {                         \
+                     workspace_tensor, acl_stream, executor]() mutable -> int { \
+      /* Empty the retained queue closure after launch; keep storage locally. */ \
+      auto workspace_owner = std::move(workspace_tensor);                     \
+      (void)workspace_owner;                                                  \
       typedef int (*OpApiFunc)(void *, uint64_t, aclOpExecutor *,             \
                                const aclrtStream);                            \
       OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);       \

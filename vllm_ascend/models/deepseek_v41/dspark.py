@@ -50,6 +50,7 @@ from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
 from vllm_ascend.utils import enable_dsa_cp, normalize_deepseek_v41_config
 
 from .model import DeepseekV41MixtureOfExperts, DeepseekV41MoE
+from vllm_ascend.models.deepseek_v4.model import _load_buffered_shared_experts
 
 
 def _apply_dsv4_rope(
@@ -477,6 +478,7 @@ class DSparkDeepseekV41ForCausalLM(torch.nn.Module, DeepseekV41MixtureOfExperts,
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        shared_experts_buffers: dict[str, torch.Tensor] = {}
 
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
@@ -504,6 +506,10 @@ class DSparkDeepseekV41ForCausalLM(torch.nn.Module, DeepseekV41MixtureOfExperts,
             # Expert scale parameters use Ascend's ``weight_scale`` convention.
             if name.endswith(".scale"):
                 name = name.replace(".scale", ".weight_scale")
+            if name.endswith(".weight_fp4"):
+                name = name.replace(".weight_fp4", ".weight")
+            elif name.endswith("_fp4"):
+                name = name[:-4]
 
             # The multimodal checkpoint also contains one vision-router bias
             # for each MTP/DSpark layer.  DSpark runs only during text decode,
@@ -519,6 +525,8 @@ class DSparkDeepseekV41ForCausalLM(torch.nn.Module, DeepseekV41MixtureOfExperts,
                     if weight_name not in name:
                         continue
                     name_mapped = name.replace(weight_name, param_name)
+                    if name_mapped not in params_dict:
+                        continue
                     param = params_dict[name_mapped]
                     weight_loader = typing.cast(typing.Callable[..., bool], param.weight_loader)
                     success = weight_loader(
@@ -533,6 +541,9 @@ class DSparkDeepseekV41ForCausalLM(torch.nn.Module, DeepseekV41MixtureOfExperts,
                         loaded_params.add(name_mapped)
                         break
                 continue
+            if "shared_expert" in name:
+                shared_experts_buffers[name] = loaded_weight.cpu()
+                continue
 
             # Stacked rules only apply to decoder-layer weights. Head-stack
             # parameters load directly through the fallback below.
@@ -541,12 +552,16 @@ class DSparkDeepseekV41ForCausalLM(torch.nn.Module, DeepseekV41MixtureOfExperts,
                 if not is_layer_param or f".{weight_name}." not in name:
                     continue
                 name = name.replace(weight_name, param_name)
+                if name not in params_dict:
+                    continue
                 param = params_dict[name]
                 param.weight_loader(param, loaded_weight, stacked_shard_id)
                 loaded_params.add(name)
                 break
             else:
                 if "attn_sink" in name:
+                    if name not in params_dict:
+                        continue
                     if enable_dsa_cp():
                         narrow = loaded_weight
                     else:
@@ -555,10 +570,20 @@ class DSparkDeepseekV41ForCausalLM(torch.nn.Module, DeepseekV41MixtureOfExperts,
                         params_dict[name].copy_(narrow)
                     loaded_params.add(name)
                     continue
+                if name not in params_dict:
+                    head, _, leaf = name.rpartition(".")
+                    suffixed = f"{head}.base_layer.{leaf}"
+                    if suffixed in params_dict:
+                        name = suffixed
+                    else:
+                        continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
+
+        if shared_experts_buffers:
+            _load_buffered_shared_experts(shared_experts_buffers, params_dict, loaded_params)
 
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params

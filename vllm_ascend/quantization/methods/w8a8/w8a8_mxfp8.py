@@ -27,6 +27,8 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
+from vllm_ascend.device.device_config import get_ascend_device_type
+from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 from vllm_ascend.ops.fused_moe.moe_utils import cumsum_group_list, maybe_normalize_mxfp_scale_layout
@@ -49,6 +51,53 @@ from ..base import (
     WeightSwitchGatherSpec,
 )
 from ..registry import register_scheme
+
+
+FP8_DEQUANT_ROWS_PER_STEP = 1024
+
+
+def resolve_fp8_linear_weight_on_cpu(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_shape: tuple[int, int],
+) -> torch.Tensor:
+    """Decode checkpoint bytes and apply block scales before copying BF16 to NPU.
+
+    Atlas A2 cannot cast an FP8 device tensor to BF16. Transfer its uint8
+    view instead, and perform the FP8 conversion on CPU during weight loading.
+    Scales are multiplied in FP32 before rounding the result to BF16.
+    """
+    if weight.ndim != 2 or weight.dtype != torch.float8_e4m3fn:
+        raise ValueError("Expected a 2D E4M3FN checkpoint weight for BF16 dequantization.")
+    block_n, block_k = block_shape
+    if block_n <= 0 or block_k <= 0:
+        raise ValueError("FP8 block dimensions must be positive.")
+    rows, columns = weight.shape
+    expected_scale_shape = (cdiv(rows, block_n), cdiv(columns, block_k))
+    if tuple(weight_scale.shape) != expected_scale_shape:
+        raise ValueError(
+            f"FP8 weight {tuple(weight.shape)} with blocks {block_shape} needs "
+            f"scales {expected_scale_shape}, got {tuple(weight_scale.shape)}."
+        )
+
+    weight_bytes = weight.detach().view(torch.uint8).cpu()
+    if weight_scale.dtype in (torch.uint8, getattr(torch, "float8_e8m0fnu", torch.uint8)):
+        scale_bytes = weight_scale.detach().view(torch.uint8).cpu().to(torch.int32)
+        scales = torch.pow(2.0, scale_bytes.to(torch.float32) - 127)
+        scales = torch.where(scale_bytes == 255, torch.full_like(scales, float("nan")), scales)
+    else:
+        scales = weight_scale.detach().cpu().to(torch.float32)
+
+    resolved = torch.empty((rows, columns), dtype=torch.bfloat16, device="cpu")
+    rows_per_step = max(block_n, FP8_DEQUANT_ROWS_PER_STEP // block_n * block_n)
+    for row_start in range(0, rows, rows_per_step):
+        row_end = min(row_start + rows_per_step, rows)
+        row_scales = scales[row_start // block_n : cdiv(row_end, block_n)]
+        row_scales = row_scales.repeat_interleave(block_n, dim=0)[: row_end - row_start]
+        row_scales = row_scales.repeat_interleave(block_k, dim=1)[:, :columns]
+        decoded = weight_bytes[row_start:row_end].view(torch.float8_e4m3fn).to(torch.float32)
+        resolved[row_start:row_end] = decoded * row_scales
+    return resolved
 
 
 @register_scheme("W8A8_MXFP8", "linear")
@@ -125,6 +174,23 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
+        if getattr(layer, "_mxfp8_bf16_fallback", False):
+            if isinstance(x, tuple):
+                raise ValueError("The BF16 linear fallback requires unquantized activations.")
+            weight = layer.weight
+            x = x.to(weight.dtype)
+            if weight.ndim == 2:
+                output = torch.matmul(x, weight)
+            elif weight.ndim == 3 and x.ndim == 3:
+                output = torch.einsum("bgi,gio->bgo", x, weight)
+            else:
+                raise ValueError(
+                    f"Unsupported BF16 linear shapes: input {tuple(x.shape)}, weight {tuple(weight.shape)}."
+                )
+            if bias is not None:
+                output = output + bias
+            return output
+
         if isinstance(x, PreparedLinearInput):
             quantized_x = x.quantized
             if x.scale is None:
@@ -802,7 +868,12 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
     def __init__(self, weight_block_size):
         super().__init__()
         self.block_size = weight_block_size[0]
-        hf_config = get_current_vllm_config().model_config.hf_config
+        self.weight_block_size = tuple(weight_block_size)
+        vllm_config = get_current_vllm_config()
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        hf_config = vllm_config.model_config.hf_config
+        self.n_groups = hf_config.o_groups
+        self.n_local_groups = self.n_groups // tp_size
         self.o_lora_rank = hf_config.o_lora_rank
 
     def get_pergroup_param(
@@ -817,6 +888,27 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
         return params_dict
 
     def process_weights_after_loading(self, layer):
+        if get_ascend_device_type() != AscendDeviceType.A5:
+            if getattr(layer, "_mxfp8_bf16_fallback", False):
+                return
+            original_shape = tuple(layer.weight.shape)
+            resolved = resolve_fp8_linear_weight_on_cpu(layer.weight, layer.weight_scale, self.weight_block_size)
+            if layer.prefix.endswith("wo_a"):
+                resolved = resolved.reshape(self.n_local_groups, self.o_lora_rank, -1).transpose(1, 2)
+            else:
+                resolved = resolved.transpose(0, 1)
+            target = resolved.contiguous().to(layer.weight.device)
+            buffer = getattr(layer, "_mxfp8_bf16_weight_buf", None)
+            if buffer is not None:
+                buffer.copy_(target)
+            else:
+                layer._mxfp8_bf16_weight_buf = target
+            layer._mxfp8_checkpoint_weight_shape = original_shape
+            layer.weight.data = layer._mxfp8_bf16_weight_buf
+            layer._mxfp8_bf16_fallback = True
+            logger.info_once("Using CPU FP8 block dequantization for DeepSeek BF16 linear weights.")
+            return
+
         if layer.weight_scale.data.dtype == torch.float8_e8m0fnu:
             layer.weight_scale.data = layer.weight_scale.data.view(torch.uint8)
         else:
@@ -854,3 +946,16 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
             # dimension, which requires contiguous HCCL inputs.
             layer.weight.data = layer.weight.data.contiguous()
             layer.weight_scale.data = layer.weight_scale.data.contiguous()
+
+    def restore_weights_for_rl_loading(self, layer):
+        if getattr(layer, "_mxfp8_bf16_fallback", False):
+            # The loader must overwrite the complete FP8 checkpoint weight.
+            # Retain the BF16 buffer so processing the reload preserves its address.
+            layer.weight.data = torch.empty(
+                layer._mxfp8_checkpoint_weight_shape,
+                dtype=torch.float8_e4m3fn,
+                device=layer.weight.device,
+            )
+            layer._mxfp8_bf16_fallback = False
+            return
+        super().restore_weights_for_rl_loading(layer)

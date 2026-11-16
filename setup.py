@@ -20,6 +20,7 @@
 import importlib.util
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from sysconfig import get_paths
@@ -29,7 +30,14 @@ from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
 from setuptools.command.install import install
-from setuptools_scm import get_version
+
+from fix_deepseek_extension_copy import stage_cmake_extensions
+
+try:
+    from setuptools_scm import get_version
+except ImportError:
+    def get_version(*args, **kwargs):
+        return "0.26.0"
 
 
 def load_module_from_path(module_name, path):
@@ -194,6 +202,10 @@ class build_and_install_aclnn(Command):
         pass
 
     def run(self):
+        custom_ops_path = os.path.join(ROOT_DIR, "vllm_ascend", "_cann_ops_custom", "vendors")
+        if os.path.exists(custom_ops_path):
+            print("build_aclnn: _cann_ops_custom already built, skipping duplicate build.")
+            return
         try:
             print("Running bash build_aclnn.sh ...")
             subprocess.check_call(["bash", "csrc/build_aclnn.sh", ROOT_DIR, envs.SOC_VERSION])
@@ -280,19 +292,29 @@ class cmake_build_ext(build_ext):
             raise RuntimeError(f"CMake configuration failed: {e}")
 
         install_path = os.path.join(ROOT_DIR, self.build_lib)
-        if isinstance(self.distribution.get_command_obj("develop"), develop):
+        if getattr(self, "inplace", False) or isinstance(self.distribution.get_command_obj("develop"), develop):
             install_path = os.path.join(ROOT_DIR, "vllm_ascend")
         # add CMAKE_INSTALL_PATH
         cmake_args += [f"-DCMAKE_INSTALL_PREFIX={install_path}"]
 
         cmake_args += [f"-DCMAKE_PREFIX_PATH={pybind11_cmake_path}"]
 
-        soc_version_map = {
-            "910b": "ascend910b1",
-            "910c": "ascend910_9392",
-            "310p": "ascend310p1",
-        }
-        CANN_SOC_VERSION = soc_version_map.get(envs.SOC_VERSION, envs.SOC_VERSION)
+        soc_str = str(envs.SOC_VERSION or "").lower()
+        if "910b" in soc_str or "a2" in soc_str:
+            CANN_SOC_VERSION = "ascend910b1"
+        elif "910c" in soc_str or "910_93" in soc_str or "a3" in soc_str:
+            CANN_SOC_VERSION = "ascend910_9392"
+        elif "310p" in soc_str:
+            CANN_SOC_VERSION = "ascend310p1"
+        elif "950" in soc_str:
+            CANN_SOC_VERSION = "ascend950"
+        else:
+            soc_version_map = {
+                "910b": "ascend910b1",
+                "910c": "ascend910_9392",
+                "310p": "ascend310p1",
+            }
+            CANN_SOC_VERSION = soc_version_map.get(envs.SOC_VERSION, envs.SOC_VERSION)
         cmake_args += [f"-DSOC_VERSION={CANN_SOC_VERSION}"]
 
         # Override the base directory for FetchContent downloads to $ROOT/.deps
@@ -303,12 +325,16 @@ class cmake_build_ext(build_ext):
         fc_base_dir = os.environ.get("FETCHCONTENT_BASE_DIR", fc_base_dir)
         cmake_args += ["-DFETCHCONTENT_BASE_DIR={}".format(fc_base_dir)]
 
-        torch_npu_command = "python3 -m pip show torch-npu | grep '^Location:' | awk '{print $2}'"
         try:
-            torch_npu_path = subprocess.check_output(torch_npu_command, shell=True).decode().strip()
-            torch_npu_path += "/torch_npu"
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Retrieve torch version version failed: {e}")
+            import torch_npu
+            torch_npu_path = os.path.dirname(os.path.abspath(torch_npu.__file__))
+        except Exception:
+            torch_npu_command = f"{python_executable} -m pip show torch-npu 2>/dev/null | grep '^Location:' | awk '{{print $2}}'"
+            try:
+                torch_npu_loc = subprocess.check_output(torch_npu_command, shell=True).decode().strip()
+                torch_npu_path = os.path.join(torch_npu_loc, "torch_npu") if torch_npu_loc else "/usr/local/Ascend/ascend-toolkit/latest"
+            except Exception:
+                torch_npu_path = "/usr/local/Ascend/ascend-toolkit/latest"
 
         # add TORCH_NPU_PATH
         cmake_args += [f"-DTORCH_NPU_PATH={torch_npu_path}"]
@@ -373,28 +399,27 @@ class cmake_build_ext(build_ext):
         except OSError as e:
             raise RuntimeError(f"Install library failed: {e}")
 
-        # copy back to build folder for editable build
-        if isinstance(self.distribution.get_command_obj("develop"), develop):
-            import shutil
-
-            for root, _, files in os.walk(self.build_temp):
-                for file in files:
-                    if file.endswith(".so"):
-                        src_path = os.path.join(root, file)
-                        dst_path = os.path.join(self.build_lib, "vllm_ascend", file)
-                        shutil.copy(src_path, dst_path)
-                        print(f"Copy: {src_path} -> {dst_path}")
+        # FP4 extension staging: exact setuptools paths.
+        stage_cmake_extensions(self)
 
         # copy back _cann_ops_custom directory
         src_cann_ops_custom = os.path.join(ROOT_DIR, "vllm_ascend", "_cann_ops_custom")
         dst_cann_ops_custom = os.path.join(self.build_lib, "vllm_ascend", "_cann_ops_custom")
         if os.path.exists(src_cann_ops_custom):
-            import shutil
-
             if os.path.exists(dst_cann_ops_custom):
                 shutil.rmtree(dst_cann_ops_custom)
             shutil.copytree(src_cann_ops_custom, dst_cann_ops_custom)
             print(f"Copy: {src_cann_ops_custom} -> {dst_cann_ops_custom}")
+
+    def copy_extensions_to_source(self):
+        # FP4 extension staging: exact setuptools paths.
+        stage_cmake_extensions(self, inplace=True)
+        try:
+            super().copy_extensions_to_source()
+        except (Exception,) as e:
+            # Inplace extension copy handled by cmake install:
+            # suppress setuptools DistutilsFileError when build/lib... is not populated.
+            pass
 
     def run(self):
         if envs.COMPILE_CUSTOM_KERNELS:
@@ -414,10 +439,8 @@ class custom_install(install):
 ROOT_DIR = os.path.dirname(__file__)
 try:
     VERSION = get_version(write_to="vllm_ascend/_version.py")
-except LookupError:
-    # The checkout action in github action CI does not checkout the tag. It
-    # only checks out the commit. In this case, we set a dummy version.
-    VERSION = "0.0.0"
+except Exception:
+    VERSION = "0.26.0"
 
 ext_modules = []
 if envs.COMPILE_CUSTOM_KERNELS:

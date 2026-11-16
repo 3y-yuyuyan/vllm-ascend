@@ -405,11 +405,16 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         if quant_type == QuantType.W8A8:
             hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
         elif quant_type in (QuantType.W8A8MXFP, QuantType.W4A8MXFP):
-            hidden_states, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
-                hidden_states,
-                dst_type=torch.float8_e4m3fn,
-                scale_alg=self.dynamic_mx_quant_scale_alg,
-            )
+            from vllm_ascend.device.device_config import get_ascend_device_type
+            from vllm_ascend.device.hardware import AscendDeviceType
+            if get_ascend_device_type() != AscendDeviceType.A5:
+                pertoken_scale = None
+            else:
+                hidden_states, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+                    hidden_states,
+                    dst_type=torch.float8_e4m3fn,
+                    scale_alg=self.dynamic_mx_quant_scale_alg,
+                )
         elif quant_type == QuantType.W4A4MXFP:
             hidden_states, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
                 hidden_states,

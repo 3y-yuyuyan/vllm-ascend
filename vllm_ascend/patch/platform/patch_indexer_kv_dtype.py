@@ -56,31 +56,17 @@ from vllm.logger import logger
 # if upstream adds more formats. (The starred-subscript Literal is only
 # analyzable at runtime, so mypy flags it as an invalid type alias -- the
 # explicit ignore below is the same pattern used elsewhere in this package.)
-_ORIG_INDEXER_KV_DTYPE = _attention_mod.IndexerKVDType
-_INDEXER_KV_DTYPE_WITH_INT8 = typing.Literal[*_ORIG_INDEXER_KV_DTYPE.__args__ + ("int8",)]  # type: ignore[valid-type]
+_ORIG_INDEXER_KV_DTYPE = getattr(_attention_mod, "IndexerKVDType", None)
+if _ORIG_INDEXER_KV_DTYPE is not None:
+    _INDEXER_KV_DTYPE_WITH_INT8 = typing.Literal[*_ORIG_INDEXER_KV_DTYPE.__args__ + ("int8",)]  # type: ignore[valid-type]
+else:
+    _INDEXER_KV_DTYPE_WITH_INT8 = None
 
 
 def _apply_indexer_kv_dtype_int8_patch() -> None:
-    """Widen ``AttentionConfig.indexer_kv_dtype`` to accept ``"int8"``.
-
-    A pydantic dataclass caches its core schema / validator at class-build
-    time from the field annotations. Mutating the annotation alone is not
-    enough; the schema must be rebuilt. Three places hold the old Literal:
-
-      1. ``vllm.config.attention.IndexerKVDType`` -- the module-level symbol
-         re-exported / imported by other modules (e.g. minimax_m3 indexer).
-      2. ``AttentionConfig.__annotations__["indexer_kv_dtype"]`` -- the inline
-         annotation on the class.
-      3. ``AttentionConfig.__dataclass_fields__["indexer_kv_dtype"].type`` --
-         the stdlib dataclass field type, which pydantic's
-         ``collect_dataclass_fields`` reads when rebuilding (not the
-         ``__pydantic_fields__`` FieldInfo, which it overwrites).
-
-    After updating all three we call ``rebuild_dataclass(force=True)`` to
-    regenerate the validator + core schema. This is idempotent and safe to
-    call multiple times / across plugin entry points (the ``force`` flag
-    rebuilds even though ``__pydantic_complete__`` is already True).
-    """
+    """Widen ``AttentionConfig.indexer_kv_dtype`` to accept ``"int8"``."""
+    if _ORIG_INDEXER_KV_DTYPE is None or _INDEXER_KV_DTYPE_WITH_INT8 is None:
+        return
     # Idempotency: if int8 is already accepted, nothing to do.
     existing_args = getattr(_ORIG_INDEXER_KV_DTYPE, "__args__", ())
     if "int8" in existing_args:

@@ -19,6 +19,7 @@
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -40,9 +41,162 @@ from ..base import (
     WeightSwitchGatherSpec,
 )
 from ..registry import register_scheme
+from .fp4_decode_cache import clear_fp4_decode_cache, decode_active_fp4_weights, initialize_fp4_decode_cache
+from .fp4_int8_cube import apply_fp4_int8_gmm, initialize_fp4_int8_layer, quantize_fp4_int8_activation
 
 # CANN uses 36 to select FP8 E4M3FN output for situ_mx_quant.
 SITU_MX_DST_TYPE_E4M3FN = 36
+
+# W4A8 MXFP4 执行路径：按"已验证的设备能力"选择，而不是宽泛的"非 A5"。
+_MXFP4_PATH_NATIVE = "native"
+_MXFP4_PATH_FALLBACK = "bf16_fallback"
+
+
+def _mxfp4_path() -> str:
+    """Return the W4A8 MXFP4 execution path for the current device/config.
+
+    - A5: native FP4 quant matmul (needs NZ/FP8 weight layout).
+    - A2 (910B family) with ``VLLM_ASCEND_FP4_MXFP4_FALLBACK=1``: BF16
+      fallback that decodes packed FP4 weights at call time. Operator-level
+      validation exists only on Ascend 910B4-1; enabling it on other A2
+      variants is the operator's explicit responsibility.
+    - A3 (910C), _310P, or A2 without the switch: raise, never silently run
+      an unverified path.
+
+    Kept as a single function so all call sites stay consistent.
+    """
+    from vllm_ascend import envs
+    from vllm_ascend.device.device_config import get_ascend_device_type
+    from vllm_ascend.device.hardware import AscendDeviceType
+
+    device_type = get_ascend_device_type()
+    if device_type == AscendDeviceType.A5:
+        return _MXFP4_PATH_NATIVE
+    if device_type == AscendDeviceType.A2 and envs.VLLM_ASCEND_FP4_MXFP4_FALLBACK:
+        return _MXFP4_PATH_FALLBACK
+    raise RuntimeError(
+        f"W4A8 MXFP4 is not enabled on device_type={device_type}. "
+        "A5 uses the native FP4 quant matmul; the BF16 fallback is validated "
+        "only on Ascend 910B4-1 (A2) and must be enabled explicitly with "
+        "VLLM_ASCEND_FP4_MXFP4_FALLBACK=1. Refusing to run an unverified path."
+    )
+
+# Device-resident LUT cache to eliminate Host-to-Device memory copy during CUDA Graph capture
+_LUT_MAP: dict[str, torch.Tensor] = {}
+
+
+def get_lut(device: torch.device) -> torch.Tensor:
+    dev_key = str(device)
+    lut = _LUT_MAP.get(dev_key)
+    if lut is None or lut.device != device:
+        lut = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        _LUT_MAP[dev_key] = lut
+    return lut
+
+
+def dequant_fp4_to_bf16(
+    w_fp4: torch.Tensor,
+    w_scale: torch.Tensor,
+    block_size: int = 32,
+    chunk_size: int = 2,
+    transpose: bool = False,
+) -> torch.Tensor:
+    """Dynamically decode packed MXFP4 weights and E8M0 scale to bfloat16 with minimal memory footprint and zero host-device sync."""
+    lut = get_lut(w_fp4.device)
+    ndim = w_fp4.ndim
+
+    if ndim == 3:
+        num_experts = w_fp4.shape[0]
+        dim1 = w_fp4.shape[1]
+        dim2 = w_fp4.shape[2] * 2
+        if transpose:
+            out = torch.empty((num_experts, dim2, dim1), dtype=torch.bfloat16, device=w_fp4.device)
+        else:
+            out = torch.empty((num_experts, dim1, dim2), dtype=torch.bfloat16, device=w_fp4.device)
+
+        for i in range(0, num_experts, chunk_size):
+            end = min(i + chunk_size, num_experts)
+            c_fp4 = w_fp4[i:end]
+            c_scale = w_scale[i:end]
+
+            c_shape = list(c_fp4.shape)
+            c_shape[-1] *= 2
+
+            low = c_fp4 & 0x0F
+            high = (c_fp4 >> 4) & 0x0F
+            interleaved = torch.stack([low, high], dim=-1).reshape(c_shape)
+            decoded = lut[interleaved.to(torch.int32)]
+
+            scale_raw = c_scale.view(torch.uint8).to(torch.int32)
+            powers = torch.pow(2.0, (scale_raw - 127).to(torch.float32)).to(torch.bfloat16)
+            scale_float = torch.where(scale_raw == 0, torch.zeros_like(powers), powers)
+
+            if scale_float.shape[-1] * block_size == decoded.shape[-1]:
+                chunk_res = (decoded.view(*scale_float.shape, block_size) * scale_float.unsqueeze(-1)).view(c_shape)
+            else:
+                scale_expanded = scale_float.repeat_interleave(block_size, dim=-1)
+                if scale_expanded.shape[-1] > decoded.shape[-1]:
+                    scale_expanded = scale_expanded[..., : decoded.shape[-1]]
+                chunk_res = decoded * scale_expanded
+
+            if transpose:
+                out[i:end].copy_(chunk_res.transpose(1, 2))
+            else:
+                out[i:end].copy_(chunk_res)
+        return out
+
+    elif ndim == 2:
+        rows = w_fp4.shape[0]
+        cols = w_fp4.shape[1] * 2
+        chunk_rows = max(1, min(128, rows))
+        out = torch.empty((rows, cols), dtype=torch.bfloat16, device=w_fp4.device)
+        for i in range(0, rows, chunk_rows):
+            end = min(i + chunk_rows, rows)
+            c_fp4 = w_fp4[i:end]
+            c_scale = w_scale[i:end]
+
+            c_shape = list(c_fp4.shape)
+            c_shape[-1] *= 2
+
+            low = c_fp4 & 0x0F
+            high = (c_fp4 >> 4) & 0x0F
+            interleaved = torch.stack([low, high], dim=-1).reshape(c_shape)
+            decoded = lut[interleaved.to(torch.int32)]
+
+            scale_raw = c_scale.view(torch.uint8).to(torch.int32)
+            powers = torch.pow(2.0, (scale_raw - 127).to(torch.float32)).to(torch.bfloat16)
+            scale_float = torch.where(scale_raw == 0, torch.zeros_like(powers), powers)
+
+            if scale_float.shape[-1] * block_size == decoded.shape[-1]:
+                chunk_res = (decoded.view(*scale_float.shape, block_size) * scale_float.unsqueeze(-1)).view(c_shape)
+            else:
+                scale_expanded = scale_float.repeat_interleave(block_size, dim=-1)
+                if scale_expanded.shape[-1] > decoded.shape[-1]:
+                    scale_expanded = scale_expanded[..., : decoded.shape[-1]]
+                chunk_res = decoded * scale_expanded
+
+            out[i:end].copy_(chunk_res)
+        return out
+    else:
+        orig_shape = list(w_fp4.shape)
+        orig_shape[-1] *= 2
+        low = w_fp4 & 0x0F
+        high = (w_fp4 >> 4) & 0x0F
+        interleaved = torch.stack([low, high], dim=-1).reshape(orig_shape)
+        decoded = lut[interleaved.to(torch.int32)]
+        scale_raw = w_scale.view(torch.uint8).to(torch.int32)
+        powers = torch.pow(2.0, (scale_raw - 127).to(torch.float32)).to(torch.bfloat16)
+        scale_float = torch.where(scale_raw == 0, torch.zeros_like(powers), powers)
+        if scale_float.shape[-1] * block_size == decoded.shape[-1]:
+            return (decoded.view(*scale_float.shape, block_size) * scale_float.unsqueeze(-1)).view(orig_shape)
+        scale_expanded = scale_float.repeat_interleave(block_size, dim=-1)
+        if scale_expanded.shape[-1] > decoded.shape[-1]:
+            scale_expanded = scale_expanded[..., : decoded.shape[-1]]
+        return decoded * scale_expanded
 
 
 @register_scheme("W4A8_MXFP", "linear")
@@ -92,6 +246,30 @@ class AscendW4A8MXFPDynamicLinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
+        # BF16 回退（仅 A2 且显式开启 VLLM_ASCEND_FP4_MXFP4_FALLBACK）：
+        # 权重保持加载时的原始 FP4 布局，在此按原始布局现场解码后做线性运算。
+        # A5 走原生 FP4 量化矩阵乘（需要 NZ/FP8 转换后的布局）；
+        # 其余设备由 _mxfp4_path() 显式拒绝。
+        if _mxfp4_path() == _MXFP4_PATH_FALLBACK:
+            if isinstance(x, tuple):
+                x = x[0].to(torch.bfloat16)
+            else:
+                x = x.to(torch.bfloat16)
+            w = layer.weight.data
+            if w.dtype == torch.uint8:
+                w = dequant_fp4_to_bf16(w, layer.weight_scale.data, self.group_size)
+            elif w.dtype != torch.bfloat16:
+                w = w.to(torch.bfloat16)
+            if w.ndim == 2:
+                if w.shape[0] == x.shape[-1]:
+                    out = torch.matmul(x, w)
+                    if bias is not None:
+                        out = out + bias
+                    return out
+                elif w.shape[1] == x.shape[-1]:
+                    return F.linear(x, w, bias)
+            return F.linear(x, w, bias)
+
         if isinstance(x, PreparedLinearInput):
             quantized_x = x.quantized
             assert x.scale is not None
@@ -120,24 +298,40 @@ class AscendW4A8MXFPDynamicLinearMethod(AscendLinearScheme):
         return output
 
     def process_weights_after_loading(self, layer):
-        """Cast the weight to NZ format and reshape its scale for NPU inference.
+        """Cast the weight to NZ format and reshape its scale for NPU inference (A5 only).
 
-        Records the original shapes and marks the layer transformed so
-        ``restore_weights_for_rl_loading`` can reverse it before an RL reload.
+        The BF16 fallback (see ``_mxfp4_path``) runs in ``apply``, which decodes
+        the original FP4 layout at call time.  The weight and scale must therefore
+        keep their loader-provided ``[out, in/2]`` / ``[out, in/group_size]``
+        layout; transposing/reshaping them here would feed the decoder a
+        layout it cannot interpret (dimension error or silent wrong results).
         """
         if getattr(layer, "_mxfp4_transformed", False):
+            return
+        if _mxfp4_path() == _MXFP4_PATH_FALLBACK:
+            # 保持原始布局；不置位 _mxfp4_transformed，
+            # restore_weights_for_rl_loading 自然成为空操作。
             return
         if not hasattr(layer, "_mxfp4_original_shapes"):
             layer._mxfp4_original_shapes = {
                 "weight": tuple(layer.weight.data.shape),
                 "weight_scale": tuple(layer.weight_scale.data.shape),
             }
-        layer.weight.data = torch_npu.npu_format_cast(
-            layer.weight.data,
-            ACL_FORMAT_FRACTAL_NZ,
-            customize_dtype=torch.float8_e4m3fn,
-            input_dtype=torch_npu.float4_e2m1fn_x2,
-        )
+        try:
+            layer.weight.data = torch_npu.npu_format_cast(
+                layer.weight.data,
+                ACL_FORMAT_FRACTAL_NZ,
+                customize_dtype=torch.float8_e4m3fn,
+                input_dtype=torch_npu.float4_e2m1fn_x2,
+            )
+        except Exception as err:
+            # 转换失败后继续 transpose/reshape 会留下"半变换"的权重布局，
+            # A5 的原生量化矩阵乘会读到错误数据；必须显式失败。
+            raise RuntimeError(
+                "npu_format_cast failed for MXFP4 weight (A5 requires the "
+                "FP4(x2)->FP8 NZ cast); aborting instead of continuing with a "
+                "half-transformed layout. Original error: " + str(err)
+            ) from err
         layer.weight.data = layer.weight.data.transpose(-1, -2)
         n, k = layer.weight_scale.shape
         layer.weight_scale.data = layer.weight_scale.data.reshape(n, k // 2, 2).transpose(-3, -2)
@@ -211,6 +405,10 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         shared_experts: Any | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
+        # BF16 回退时用 None 关闭原生 MXFP4 量化参数。
+        # 路径由 _mxfp4_path() 统一判定；原生 FP4 INT8 Cube 另有 pure-TP 限制，
+        # 见 fp4_int8_cube.initialize_fp4_int8_layer 的 EP 校验。
+        use_bf16_fallback = _mxfp4_path() == _MXFP4_PATH_FALLBACK
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         return moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
@@ -226,11 +424,11 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 pertoken_scale=layer.ascend_pertoken_scale,
                 activation=layer.activation,
-                mxfp_act_quant_type=torch.float8_e4m3fn,
-                mxfp_weight_quant_type=torch_npu.float4_e2m1fn_x2,
-                mxfp_scale_dtype=torch_npu.float8_e8m0fnu,
-                mxfp_per_token_scale_dtype=torch_npu.float8_e8m0fnu,
-                mxfp_use_bf16=(x.dtype in [torch.bfloat16, torch.float8_e4m3fn]),
+                mxfp_act_quant_type=None if use_bf16_fallback else torch.float8_e4m3fn,
+                mxfp_weight_quant_type=None if use_bf16_fallback else torch_npu.float4_e2m1fn_x2,
+                mxfp_scale_dtype=None if use_bf16_fallback else torch_npu.float8_e8m0fnu,
+                mxfp_per_token_scale_dtype=None if use_bf16_fallback else torch_npu.float8_e8m0fnu,
+                mxfp_use_bf16=True if use_bf16_fallback else (x.dtype in [torch.bfloat16, torch.float8_e4m3fn]),
             ),
             quant_method=self,
         )
@@ -298,6 +496,12 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         EPLB list weights are intentionally not reversible for RL reload.
         """
         if getattr(layer, "_mxfp4_transformed", False):
+            return
+        if _mxfp4_path() == _MXFP4_PATH_FALLBACK:
+            vllm_config = get_current_vllm_config()
+            initialize_fp4_int8_layer(layer, vllm_config, self.group_size)
+            initialize_fp4_decode_cache(layer, vllm_config)
+            layer._mxfp4_transformed = True
             return
         if not hasattr(layer, "_mxfp4_original_shapes"):
             layer._mxfp4_original_shapes = {
@@ -430,6 +634,10 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         """
         if not getattr(layer, "_mxfp4_transformed", False):
             return
+        if _mxfp4_path() == _MXFP4_PATH_FALLBACK:
+            clear_fp4_decode_cache(layer)
+            layer._mxfp4_transformed = False
+            return
         if self.use_expert_weight_list:
             raise RuntimeError("RL weight reload is not supported together with W4A8-MXFP EPLB.")
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
@@ -461,8 +669,18 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             [layer.w2_weight],
             [layer.w2_weight_scale],
         )
+    def supports_fused_activation(self, activation) -> bool:
+        if _mxfp4_path() == _MXFP4_PATH_FALLBACK:
+            return False
+        return getattr(activation, "value", activation) in self.fused_activations
 
     def apply_gmm1_act_quant(self, mlp_compute_input: MoEMlpComputeInput):
+        if _mxfp4_path() == _MXFP4_PATH_FALLBACK:
+            h = self.apply_gmm1(mlp_compute_input)
+            from vllm_ascend.ops.fused_moe.moe_mlp import _unified_apply_activation
+            h = _unified_apply_activation(mlp_compute_input, h, self)
+            return h, None
+
         hidden_states = mlp_compute_input.hidden_states
         hidden_states, pertoken_scale = self._quant_hidden_states(hidden_states, mlp_compute_input.dynamic_scale)
         layer = mlp_compute_input.layer
@@ -534,7 +752,7 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             group_index = mlp_compute_input.group_list[-1:]
         else:
             group_index = cumsum_group_list(mlp_compute_input.group_list, mlp_compute_input.group_list_type, 1)
-        hidden_states, out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
+            hidden_states, out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
             hidden_states,
             topk_weight=None,
             group_index=group_index,
@@ -545,6 +763,36 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         return hidden_states, maybe_normalize_mxfp_scale_layout(out_scale)
 
     def apply_gmm1(self, mlp_compute_input: MoEMlpComputeInput):
+        if _mxfp4_path() == _MXFP4_PATH_FALLBACK:
+            layer = mlp_compute_input.layer
+            assert layer is not None
+            if mlp_compute_input.hidden_states.shape[0] == 0:
+                return mlp_compute_input.hidden_states.new_empty(
+                    (0, layer.w13_weight.shape[1]), dtype=torch.bfloat16
+                )
+            if getattr(layer, "_fp4_int8_decoder", None) is not None:
+                hidden_states = apply_fp4_int8_gmm(
+                    layer, mlp_compute_input, mlp_compute_input.hidden_states,
+                    "w13", self.group_size, mlp_compute_input.dynamic_scale,
+                )
+                dispose_tensor(mlp_compute_input.hidden_states)
+                return hidden_states
+            w13_gemm, groups = decode_active_fp4_weights(
+                layer, mlp_compute_input, "w13", dequant_fp4_to_bf16, self.group_size,
+            )
+            hidden_states = torch_npu.npu_grouped_matmul(
+                x=[mlp_compute_input.hidden_states],
+                weight=[w13_gemm],
+                split_item=2,
+                group_type=0,
+                group_list=groups,
+                group_list_type=mlp_compute_input.group_list_type,
+                output_dtype=torch.bfloat16,
+            )[0]
+            del w13_gemm
+            dispose_tensor(mlp_compute_input.hidden_states)
+            return hidden_states
+
         hidden_states = mlp_compute_input.hidden_states
         hidden_states, pertoken_scale = self._quant_hidden_states(hidden_states, mlp_compute_input.dynamic_scale)
         layer = mlp_compute_input.layer
@@ -568,10 +816,38 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         return hidden_states
 
     def apply_act_quant(self, mlp_compute_input: MoEMlpComputeInput, hidden_states: torch.Tensor):
+        if _mxfp4_path() == _MXFP4_PATH_FALLBACK:
+            if getattr(mlp_compute_input.layer, "_fp4_int8_decoder", None) is not None:
+                return quantize_fp4_int8_activation(hidden_states)
+            return hidden_states, None
+
         hidden_states, dynamic_scale = torch_npu.npu_dynamic_mx_quant(hidden_states, dst_type=torch.float8_e4m3fn)
         return hidden_states, maybe_normalize_mxfp_scale_layout(dynamic_scale)
 
     def apply_gmm2(self, mlp_compute_input: MoEMlpComputeInput, hidden_states, act_out_scale):
+        if _mxfp4_path() == _MXFP4_PATH_FALLBACK:
+            layer = mlp_compute_input.layer
+            assert layer is not None
+            if hidden_states.shape[0] == 0:
+                return hidden_states.new_empty((0, layer.w2_weight.shape[1]), dtype=torch.bfloat16)
+            if getattr(layer, "_fp4_int8_decoder", None) is not None:
+                return apply_fp4_int8_gmm(
+                    layer, mlp_compute_input, hidden_states, "w2", self.group_size, act_out_scale,
+                )
+            w2_gemm, groups = decode_active_fp4_weights(
+                layer, mlp_compute_input, "w2", dequant_fp4_to_bf16, self.group_size,
+            )
+            out = torch_npu.npu_grouped_matmul(
+                x=[hidden_states],
+                weight=[w2_gemm],
+                split_item=2,
+                group_type=0,
+                group_list=groups,
+                group_list_type=mlp_compute_input.group_list_type,
+                output_dtype=torch.bfloat16,
+            )[0]
+            del w2_gemm
+            return out
         layer = mlp_compute_input.layer
         assert layer is not None
         _, _, w2, w2_scale = self._get_mlp_weights(layer)
@@ -610,6 +886,21 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
     def get_dynamic_quant_param(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
+        # Keep checkpoint E8M0 bytes intact for the BF16 software decoder (A2 fallback).
+        # copy_(uint8 -> float8_e8m0fnu) would convert numeric values instead
+        # of preserving the exponent encoding, and requires an FP8 NPU cast.
+
+        if self.group_size <= 0:
+            raise ValueError(f"FP4 group_size must be positive, got {self.group_size}.")
+        if hidden_sizes % self.group_size or intermediate_size_per_partition % self.group_size:
+            raise ValueError(
+                f"FP4 dimensions ({hidden_sizes}, {intermediate_size_per_partition}) must be divisible "
+                f"by group_size={self.group_size}."
+            )
+        if _mxfp4_path() == _MXFP4_PATH_FALLBACK:
+            return super().get_dynamic_quant_param(
+                num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype
+            )
         param_dict = {}
         param_dict["w13_weight_scale"] = torch.empty(
             num_experts,

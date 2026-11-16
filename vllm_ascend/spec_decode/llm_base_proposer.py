@@ -23,11 +23,12 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
-from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
-from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
-from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
-from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkForCausalLM
-from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM
+# Drafter types for speculative decoding (optional stubs for vLLM compatibility)
+Eagle3DeepseekV2ForCausalLM = None
+Eagle3LlamaForCausalLM = None
+DFlashQwen3ForCausalLM = None
+Qwen3DSparkForCausalLM = None
+K3DSparkForCausalLM = None
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata

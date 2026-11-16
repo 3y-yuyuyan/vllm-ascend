@@ -24,7 +24,7 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.distributed import tensor_model_parallel_all_gather, tensor_model_parallel_reduce_scatter
 from vllm.logger import logger
-from vllm.model_executor.layers.activation import SituAndMul
+from vllm.model_executor.layers import activation as vllm_activation
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoEMethodBase
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -124,7 +124,13 @@ class AscendSharedExperts:
         self.swiglu_alpha = 1.0 if moe_config.swiglu_alpha is None else moe_config.swiglu_alpha
         self.swiglu_beta = 0.0 if moe_config.swiglu_beta is None else moe_config.swiglu_beta
         self.is_sequence_parallel = moe_config.is_sequence_parallel
-        self.situ_activation = layer.act_fn if isinstance(layer.act_fn, SituAndMul) else None
+        # Older vLLM versions do not expose the Kimi-specific Situ activation.
+        situ_activation_type = getattr(vllm_activation, "SituAndMul", None)
+        self.situ_activation = (
+            layer.act_fn
+            if situ_activation_type is not None and isinstance(layer.act_fn, situ_activation_type)
+            else None
+        )
         self.quant_type = quant_type
         self.lora_context = None
         ascend_config = get_ascend_config()
@@ -212,7 +218,8 @@ class AscendSharedExperts:
     def _apply_output_gate(self, hidden_states: torch.Tensor, shared_out: torch.Tensor) -> torch.Tensor:
         # Qwen3-Next specific gating mechanism
         if hasattr(self.layer, "expert_gate") and self.layer.expert_gate is not None:
-            gate_out, _ = self.layer.expert_gate(hidden_states)  # type: ignore
+            gate_out = self.layer.expert_gate(hidden_states)  # type: ignore
+            gate_out = gate_out[0] if isinstance(gate_out, tuple) else gate_out
             shared_out = F.sigmoid(gate_out) * shared_out
         return shared_out
 
@@ -705,6 +712,11 @@ class AscendSharedExperts:
         W8A8FP, W4A4MXFP and other schemes use the generic wrapper path.
         Active LoRA always uses that generic path to preserve its adapters.
         """
+        from vllm_ascend.device.device_config import get_ascend_device_type
+        from vllm_ascend.device.hardware import AscendDeviceType
+        if get_ascend_device_type() != AscendDeviceType.A5:
+            return SharedExpertMLPPath.LINEAR_WRAPPER
+
         has_quantized_shared_without_lora = (
             not has_lora(self.lora_context)
             and hasattr(self.layer.gate_up_proj, "weight_scale")

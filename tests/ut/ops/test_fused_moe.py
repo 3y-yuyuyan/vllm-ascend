@@ -1104,6 +1104,40 @@ class _Gate(nn.Module):
         return torch.zeros((*hidden_states.shape[:-1], 1), dtype=hidden_states.dtype), None
 
 
+@pytest.mark.parametrize("has_situ_type", [False, True])
+@pytest.mark.parametrize("uses_situ", [False, True])
+def test_shared_experts_optional_situ_activation(monkeypatch, has_situ_type, uses_situ):
+    class SituActivation(nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states.tanh()
+
+    activation_module = SimpleNamespace()
+    if has_situ_type:
+        activation_module.SituAndMul = SituActivation
+    monkeypatch.setattr(shared_experts_module, "vllm_activation", activation_module)
+    monkeypatch.setattr(
+        shared_experts_module,
+        "get_ascend_config",
+        lambda: SimpleNamespace(multistream_overlap_shared_expert=False, enable_shared_expert_dp=False),
+    )
+    act_fn = SituActivation() if uses_situ else nn.SiLU()
+    layer = SimpleNamespace(gate_up_proj=SimpleNamespace(input_size=4), act_fn=act_fn)
+    moe_config = SimpleNamespace(
+        hidden_dim=4,
+        in_dtype=torch.float32,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        is_sequence_parallel=False,
+    )
+
+    shared_experts = AscendSharedExperts(layer, moe_config, QuantType.NONE, MagicMock())
+
+    assert shared_experts.situ_activation is (act_fn if has_situ_type and uses_situ else None)
+    hidden_states = torch.randn(2, 4)
+    torch.testing.assert_close(shared_experts.apply_activation(hidden_states), act_fn(hidden_states))
+
+
 @pytest.mark.parametrize("with_gate", [False, True])
 def test_shared_experts_part2_applies_optional_gate(with_gate):
     shared_experts_layer = SimpleNamespace(

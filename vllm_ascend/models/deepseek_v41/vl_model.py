@@ -22,6 +22,10 @@ from vllm.models.deepseek_v41.common.mm_preprocess import (
     DeepseekV4VLMultiModalProcessor,
     DeepseekV4VLProcessingInfo,
 )
+try:
+    from vllm.models.deepseek_v41.common.mm_preprocess import IMAGE_PAD_ID
+except ImportError:
+    IMAGE_PAD_ID = IMAGE_SENTINEL_BASE_ID
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .model import AscendDeepseekV41LLMForCausalLM

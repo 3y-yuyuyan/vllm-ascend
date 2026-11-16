@@ -578,7 +578,7 @@ build_static_lib() {
     echo $dotted_line
     echo "Start to build static lib."
 
-    git submodule init && git submodule update
+    (git submodule init && git submodule update) 2>/dev/null || true
     cd "${BUILD_PATH}" && cmake ${CUSTOM_OPTION} .. -DENABLE_STATIC=ON -DASCEND_COMPUTE_UNIT=${unit}
     local all_targets=$(cmake --build . --target help)
     rm -fr ${BUILD_PATH}/bin_tmp
@@ -1444,7 +1444,7 @@ build_ut() {
   echo $dotted_line
   echo "Start to build ut"
 
-  git submodule init && git submodule update
+  (git submodule init && git submodule update) 2>/dev/null || true
   if [ ! -d "${BUILD_DIR}" ]; then
     mkdir -p "${BUILD_DIR}"
   fi

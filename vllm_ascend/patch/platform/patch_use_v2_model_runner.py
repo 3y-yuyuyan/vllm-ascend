@@ -51,11 +51,15 @@ def _patched_validate_v2_model_runner(self) -> None:
 
 VllmConfig._validate_v2_model_runner = _patched_validate_v2_model_runner
 
-# Both supported vLLM versions expose this helper.
-_original_get_v1_model_runner_unsupported_features = VllmConfig._get_v1_model_runner_unsupported_features
+# Both supported vLLM versions expose this helper, but older builds (< 0.29.0) do not.
+_original_get_v1_model_runner_unsupported_features = getattr(
+    VllmConfig, "_get_v1_model_runner_unsupported_features", None
+)
 
 
 def _patched_get_v1_model_runner_unsupported_features(self) -> list[str]:
+    if _original_get_v1_model_runner_unsupported_features is None:
+        return []
     unsupported = _original_get_v1_model_runner_unsupported_features(self)
     return [feature for feature in unsupported if feature not in _ASCEND_V1_SUPPORTED_FEATURES]
 
