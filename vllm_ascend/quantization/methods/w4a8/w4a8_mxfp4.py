@@ -72,12 +72,12 @@ def _mxfp4_path() -> str:
     device_type = get_ascend_device_type()
     if device_type == AscendDeviceType.A5:
         return _MXFP4_PATH_NATIVE
-    if device_type == AscendDeviceType.A2 and envs.VLLM_ASCEND_FP4_MXFP4_FALLBACK:
+    if device_type in (AscendDeviceType.A2, AscendDeviceType.A3) and envs.VLLM_ASCEND_FP4_MXFP4_FALLBACK:
         return _MXFP4_PATH_FALLBACK
     raise RuntimeError(
         f"W4A8 MXFP4 is not enabled on device_type={device_type}. "
         "A5 uses the native FP4 quant matmul; the BF16 fallback is validated "
-        "only on Ascend 910B4-1 (A2) and must be enabled explicitly with "
+        "on Ascend 910B (A2) and 910_93 (A3) and must be enabled explicitly with "
         "VLLM_ASCEND_FP4_MXFP4_FALLBACK=1. Refusing to run an unverified path."
     )
 

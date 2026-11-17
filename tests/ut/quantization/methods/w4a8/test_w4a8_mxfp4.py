@@ -403,3 +403,37 @@ class TestAscendW4A8MXFP4MoEMethod(TestBase):
             shared_experts_input=None,
         )
         mock_comm.fused_experts.assert_called_once()
+
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4._EXTRA_CTX")
+    def test_get_fused_mc2_weights_single_tensor(self, mock_ctx):
+        mock_ctx.use_mega_moe = False
+        self.scheme.use_expert_weight_list = False
+        layer = self._make_moe_layer()
+        weights = self.scheme.get_fused_mc2_weights(layer)
+        self.assertIsInstance(weights.w1, list)
+        self.assertEqual(len(weights.w1), 1)
+        self.assertIs(weights.w1[0], layer.w13_weight)
+        self.assertIsInstance(weights.w2, list)
+        self.assertEqual(len(weights.w2), 1)
+        self.assertIs(weights.w2[0], layer.w2_weight)
+        self.assertIsInstance(weights.w1_scale, list)
+        self.assertIsInstance(weights.w2_scale, list)
+        self.assertIsNone(weights.w1_scale_bias)
+        self.assertIsNone(weights.w2_scale_bias)
+
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4._EXTRA_CTX")
+    def test_get_fused_mc2_weights_expert_list(self, mock_ctx):
+        mock_ctx.use_mega_moe = False
+        self.scheme.use_expert_weight_list = True
+        layer = MagicMock()
+        layer.w13_weight_list = [torch.empty(64, 256, dtype=torch.uint8) for _ in range(self.num_experts)]
+        layer.w2_weight_list = [torch.empty(128, 128, dtype=torch.uint8) for _ in range(self.num_experts)]
+        layer.w13_weight_scale_list = [torch.empty(2, 256, dtype=torch.uint8) for _ in range(self.num_experts)]
+        layer.w2_weight_scale_list = [torch.empty(4, 128, dtype=torch.uint8) for _ in range(self.num_experts)]
+        weights = self.scheme.get_fused_mc2_weights(layer)
+        self.assertEqual(len(weights.w1), self.num_experts)
+        self.assertEqual(len(weights.w2), self.num_experts)
+        self.assertEqual(len(weights.w1_scale), self.num_experts)
+        self.assertEqual(len(weights.w2_scale), self.num_experts)
+        self.assertIsNone(weights.w1_scale_bias)
+        self.assertIsNone(weights.w2_scale_bias)
