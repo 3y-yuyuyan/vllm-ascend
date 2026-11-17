@@ -435,13 +435,10 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
 
     def get_fused_mc2_weights(self, layer: torch.nn.Module) -> MoEWeights:
         if self.use_expert_weight_list:
-            if _EXTRA_CTX.use_mega_moe:
-                w1 = layer.w13_weight_list
-                w2 = layer.w2_weight_list
-                w1_scale = layer.w13_weight_scale_list
-                w2_scale = layer.w2_weight_scale_list
-            else:
-                w1, w1_scale, w2, w2_scale = self._get_mlp_weights(layer)
+            w1 = layer.w13_weight_list
+            w2 = layer.w2_weight_list
+            w1_scale = layer.w13_weight_scale_list
+            w2_scale = layer.w2_weight_scale_list
             return MoEWeights(
                 w1=w1,
                 w2=w2,
@@ -464,10 +461,10 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             )
         else:
             return MoEWeights(
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
+                w1=[layer.w13_weight],
+                w2=[layer.w2_weight],
+                w1_scale=[layer.w13_weight_scale],
+                w2_scale=[layer.w2_weight_scale],
                 w1_scale_bias=None,
                 w2_scale_bias=None,
             )

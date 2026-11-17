@@ -38,7 +38,24 @@ std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine(
     char *group_ep_ptr = const_cast<char *>(group.data());
     bool is_int8 = weight1[0].dtype() == at::kChar;
     bool is_int4 = weight1[0].dtype() == at::kInt;
-    if (is_int8) {
+    bool is_fp4 = weight1[0].dtype() == at::kByte;
+    if (is_fp4) {
+        EXEC_NPU_CMD(aclnnDispatchFFNCombineFP4,
+                 x,
+                 weight1,
+                 weight2,
+                 expert_idx,
+                 scale1,
+                 scale2,
+                 probs,
+                 x_active_mask.has_value() ? x_active_mask.value() : at::Tensor(),
+                 group_ep_ptr,
+                 max_output_size,
+                 swiglu_limit,
+                 world_size,
+                 out,
+                 expert_token_nums);
+    } else if (is_int8) {
         EXEC_NPU_CMD(aclnnDispatchFFNCombine,
                  x,
                  weight1,

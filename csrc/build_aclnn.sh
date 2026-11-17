@@ -130,6 +130,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "fp4_int8_gmm_v2"
         "fp4_int8_gmm_v2_cache"
         "fp4_bf16_gmm_v2"
+        "dispatch_ffn_combine_fp4"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -149,6 +150,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "dispatch_ffn_combine"
         "dispatch_ffn_combine_w4_a8"
         "dispatch_ffn_combine_bf16"
+        "dispatch_ffn_combine_fp4"
         "moe_gating_top_k"
         "moe_gating_top_k_hash"
         "add_rms_norm_bias"

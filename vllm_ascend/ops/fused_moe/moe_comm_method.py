@@ -583,20 +583,33 @@ class FusedMC2CommImpl(MoECommMethod):
                     fused_experts_input, weights, is_decode_only_node=_EXTRA_CTX.is_decode_only_node
                 )
             else:
-                assert not (weights.w1_scale_bias is None or weights.w2_scale_bias is None), (
-                    "w1_scale_bias and w2_scale_bias cannot be None when enable_fused_mc2=1."
-                )
+                bias1 = weights.w1_scale_bias if weights.w1_scale_bias is not None else []
+                if isinstance(bias1, torch.Tensor):
+                    bias1 = [bias1]
+                bias2 = weights.w2_scale_bias if weights.w2_scale_bias is not None else []
+                if isinstance(bias2, torch.Tensor):
+                    bias2 = [bias2]
+
+                scale1 = weights.w1_scale if weights.w1_scale is not None else []
+                if isinstance(scale1, torch.Tensor):
+                    scale1 = [scale1]
+                scale2 = weights.w2_scale if weights.w2_scale is not None else []
+                if isinstance(scale2, torch.Tensor):
+                    scale2 = [scale2]
+
+                weight1 = weights.w1 if isinstance(weights.w1, list) else [weights.w1]
+                weight2 = weights.w2 if isinstance(weights.w2, list) else [weights.w2]
 
                 out = torch.empty_like(fused_experts_input.hidden_states)
                 torch.ops._C_ascend.dispatch_ffn_combine(  # type: ignore
                     x=fused_experts_input.hidden_states,
-                    weight1=weights.w1,
-                    weight2=weights.w2,
+                    weight1=weight1,
+                    weight2=weight2,
                     expert_idx=fused_experts_input.topk_ids,
-                    scale1=weights.w1_scale,
-                    scale2=weights.w2_scale,
-                    bias1=weights.w1_scale_bias,
-                    bias2=weights.w2_scale_bias,
+                    scale1=scale1,
+                    scale2=scale2,
+                    bias1=bias1,
+                    bias2=bias2,
                     probs=fused_experts_input.topk_weights.to(torch.float32),
                     group=self.token_dispatcher.moe_all_to_all_group_name,
                     max_output_size=get_ascend_config().mega_moe_max_tokens,
